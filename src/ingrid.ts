@@ -15,6 +15,21 @@ export const POSES = {
   walkLeft: [645, 683, 232, 347],
 } as const
 
+// Rear-body points in source pixels, measured on each pose in the atlas.
+export const TAIL_ATTACHMENTS = {
+  idle: [72, 255],
+  crawlReachLeft: [581, 173],
+  crawlStretchLeft: [911, 178],
+  crawlGatherLeft: [1224, 181],
+  jumpReadyLeft: [241, 543],
+  jumpRiseLeft: [560, 594],
+  walkRight: [704, 605],
+  jumpLandLeft: [1197, 522],
+  jumpAirLeft: [242, 928],
+  crawlRight: [384, 881],
+  walkLeft: [799, 969],
+} as const satisfies Record<keyof typeof POSES, readonly [number, number]>
+
 interface Pose {
   sprite: keyof typeof POSES
   lift?: number
