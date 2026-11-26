@@ -22,10 +22,11 @@ build: ## 检查 TypeScript 类型并构建前端
 test: ## 运行 Rust 测试
 	cargo test --manifest-path src-tauri/Cargo.toml
 
-check: ## 检查 Rust 格式和追踪脚本语法
+check: ## 检查 Rust 格式和脚本语法
 	cargo fmt --manifest-path src-tauri/Cargo.toml --check
 	sh -n tracker/setup.sh
 	sh -n tracker/bundle.sh
+	sh -n scripts/bundle-mac.sh
 
 bundle-mac: ## 打包 macOS 应用
 	npm run bundle:mac

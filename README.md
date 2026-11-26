@@ -54,15 +54,23 @@ npm run tauri -- dev
 
 开发模式下，系统可能将相机授权归到启动应用的终端。测试实际权限时可使用打包后的应用。
 
+首次打包时，请在 macOS 钥匙串准备有效的代码签名证书及其私钥。使用 Developer ID Application 证书，或使用此 Mac 已信任的本地代码签名证书。运行以下命令，找到要使用的证书名称及其前面的 40 位十六进制指纹。
+
+```sh
+security find-identity -v -p codesigning
+```
+
+将指纹保存为 `~/Library/Application Support/IngridMeow/signing-identity` 的唯一一行，也可在尚未保存指纹时用 `APPLE_SIGNING_IDENTITY` 指定。两处皆已设定时，指纹必须一致。后续构建请保留并继续使用同一签名证书及其私钥。打包命令会在构建前检查签名身份，并验证产物与追踪组件的签名。
+
 ```sh
 npm run bundle:mac
 ```
 
-产物为 `src-tauri/target/release/bundle/macos/IngridMeow.app`。跟踪组件及模型随应用打包，并使用本地 ad hoc 代码签名。构建需要下载依赖和模型，应用运行时的跟踪在本机完成。
+`npm run bundle:mac` 和 `make bundle-mac` 都会生成已验证签名的安装包。直接运行 `tauri build` 会跳过上述签名检查。默认产物为 `src-tauri/target/aarch64-apple-darwin/release/bundle/macos/IngridMeow.app`，其中包含追踪组件及模型。构建需要下载依赖和模型，应用运行时的跟踪在本机完成。
 
 从 Eyes Mouse 升级后，请在「系统设置 → 隐私与安全性 → 辅助功能」为 IngridMeow 新授予权限。IngridMeow 的应用标识为 `com.hankjs.gazemouse`，系统会将它与 Eyes Mouse 的旧条目分开识别。如果 IngridMeow 尚未保存控制动作或眼动阻尼，会分别读取旧应用保存的有效设置。
 
-更新本地签名的构建后，macOS 可能再次要求授权。如果 IngridMeow 的开关已开启但应用仍要求授权，请退出应用，在「辅助功能」用「−」移除对应的旧条目，再用「+」添加并启用你实际使用的 `IngridMeow.app`。
+从旧的临时签名构建升级时，请退出应用并替换原位置的 `IngridMeow.app`。在「辅助功能」用「−」移除旧的 IngridMeow 条目，再用「+」添加并启用已安装的新版本。之后使用同一签名身份更新同一位置的应用，可沿用这次授权。
 
 ## 资源参考
 

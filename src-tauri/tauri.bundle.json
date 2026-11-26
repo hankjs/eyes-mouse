@@ -2,7 +2,6 @@
   "bundle": {
     "externalBin": ["binaries/eyes-mouse-tracker"],
     "macOS": {
-      "signingIdentity": "-",
       "hardenedRuntime": false
     }
   }
