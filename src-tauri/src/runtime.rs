@@ -2,12 +2,11 @@ use crate::calibration::{
     median, reset_corner, Features, Fixation, Mapping, Point, Validation, CALIBRATION_POINTS,
     RESET_POINTS, VALIDATION_POINTS,
 };
-use crate::gestures::{Detector, Eyes, Gesture};
+use crate::gestures::{Detector, Eyes, Gesture, MAX_FRAME_GAP_MS};
 use crate::macos::{self, Display, Motion, MotionResult, Screen, WindowFrame};
 use crate::snake;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::unix::process::CommandExt;
@@ -27,8 +26,11 @@ const HEAD_MAX_FRAME_TIME: Duration = Duration::from_millis(64);
 const HEAD_CAPTURE_SETTLE: Duration = Duration::from_millis(250);
 const HEAD_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEAD_CAPTURE_SAMPLES: usize = 8;
+const CAPTURE_SETTLE: Duration = Duration::from_millis(260);
+const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1_400);
 const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const RESET_SETTLE: Duration = Duration::from_millis(500);
+const RESET_NEEDS_CALIBRATION: &str = "请先对当前显示器做九点校准，再用三次眨眼回正。";
 const EYE_DAMPING_FILE: &str = "eye-damping.json";
 const CONTROL_MODE_FILE: &str = "control-mode.json";
 const LEGACY_IDENTIFIER: &str = "com.hankjs.eyesmouse";
@@ -224,7 +226,53 @@ struct Session {
     mode: Exercise,
     screen: Screen,
     samples: Vec<(Features, Point)>,
-    capture: Option<Instant>,
+    capture: Option<Capture>,
+}
+
+struct Capture {
+    started: Instant,
+    last_sample: Option<Instant>,
+    fixation: Fixation,
+}
+
+impl Capture {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            last_sample: None,
+            fixation: Fixation::default(),
+        }
+    }
+
+    fn track(
+        &mut self,
+        received_at: Instant,
+        sampled_at: Instant,
+        timestamp: u64,
+        features: Option<Features>,
+    ) {
+        if sampled_at >= self.started + CAPTURE_SETTLE
+            && received_at <= self.started + CAPTURE_TIMEOUT
+        {
+            self.last_sample = Some(sampled_at);
+            self.fixation.observe(timestamp, features);
+        }
+    }
+
+    fn sample(&self) -> Option<Features> {
+        let deadline = self.started + CAPTURE_TIMEOUT;
+        if deadline - self.last_sample? > Duration::from_millis(MAX_FRAME_GAP_MS) {
+            return None;
+        }
+        self.fixation.sample()
+    }
+}
+
+fn sample_time(received_at: Instant, received_timestamp: u64, timestamp: u64) -> (Instant, u64) {
+    // Clock skew must not make a sample newer than its arrival or lengthen a fixation.
+    let timestamp = timestamp.min(received_timestamp);
+    let age = Duration::from_millis(received_timestamp - timestamp);
+    (received_at - age, timestamp)
 }
 
 #[derive(Clone, Serialize)]
@@ -279,18 +327,16 @@ impl ResetSession {
         let Some((target, ready)) = self.target else {
             return false;
         };
-        let Some(features) = features.filter(|features| {
-            self.samples
-                .first()
-                .is_none_or(|(center, _)| reset_corner(*center, *features, self.samples.len()))
-        }) else {
-            self.fixation.clear();
-            return false;
-        };
         if now - ready < RESET_SETTLE {
             return false;
         }
-        let Some(sample) = self.fixation.observe(timestamp, features) else {
+        let features = features.filter(|features| {
+            self.samples
+                .first()
+                .is_none_or(|(center, _)| reset_corner(*center, *features, self.samples.len()))
+        });
+        self.fixation.observe(timestamp, features);
+        let Some(sample) = self.fixation.sample() else {
             return false;
         };
         self.samples.push((sample, target));
@@ -316,6 +362,12 @@ impl Session {
             total: self.mode.targets().len(),
         })
     }
+
+    fn capturing(&self, started: Instant) -> bool {
+        self.capture
+            .as_ref()
+            .is_some_and(|capture| capture.started == started)
+    }
 }
 
 #[derive(Serialize)]
@@ -340,7 +392,6 @@ struct Runtime {
     last_frame: Option<Instant>,
     last_tracked: Option<Instant>,
     last_publish: Option<Instant>,
-    recent: VecDeque<(Instant, Features)>,
     head_samples: Vec<HeadPose>,
     head_capture: Option<Instant>,
     neutral: Option<(Screen, HeadPose)>,
@@ -445,7 +496,6 @@ impl Runtime {
         self.point = None;
         self.head_samples.clear();
         self.head_capture = None;
-        self.recent.clear();
         let action = self.cancel_exercises();
         if initialized {
             self.message = Some(
@@ -546,9 +596,22 @@ impl Runtime {
         self.quality = quality;
         self.point = None;
         self.last_tracked = None;
-        self.recent.clear();
+        self.clear_eye_fixations();
         self.head_samples.clear();
         self.head_capture = None;
+    }
+
+    fn clear_eye_fixations(&mut self) {
+        if let Some(capture) = self
+            .session
+            .as_mut()
+            .and_then(|session| session.capture.as_mut())
+        {
+            capture.fixation.clear();
+        }
+        if let Some(reset) = &mut self.reset {
+            reset.fixation.clear();
+        }
     }
 
     fn can_sample(&self) -> bool {
@@ -637,7 +700,8 @@ impl Runtime {
             .as_ref()
             .is_some_and(|reset| reset.expires <= Instant::now() || self.stream.is_none())
         {
-            self.message = Some("快速校准超时。请在相机中保持双眼可见，再眨眼三次重试。".into());
+            self.message =
+                Some("快速回正超时，已保留原校准。请保持双眼可见后重试，或重新做九点校准。".into());
             let action = self.cancel_reset();
             self.publish();
             action
@@ -656,9 +720,7 @@ impl Runtime {
                 self.quality = Quality::Stale;
                 self.point = None;
                 self.gestures.clear_progress();
-                if let Some(reset) = &mut self.reset {
-                    reset.fixation.clear();
-                }
+                self.clear_eye_fixations();
             }
             changed = true;
         }
@@ -690,32 +752,26 @@ impl Runtime {
                 pose,
                 bilateral_closed,
             } => {
-                let elapsed = SystemTime::now()
+                let now = Instant::now();
+                let received_timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-                if (elapsed.as_millis() as u64).abs_diff(timestamp)
-                    > STREAM_STALE.as_millis() as u64
-                {
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                if received_timestamp.abs_diff(timestamp) > STREAM_STALE.as_millis() as u64 {
                     self.gestures.clear_progress();
-                    if let Some(reset) = &mut self.reset {
-                        reset.fixation.clear();
-                    }
+                    self.clear_eye_fixations();
                     return None;
                 }
                 if self.calibration_active() || self.head_capture.is_some() {
                     if macos::display_reconfiguring() {
-                        self.recent.clear();
                         self.head_samples.clear();
-                        if let Some(reset) = &mut self.reset {
-                            reset.fixation.clear();
-                        }
+                        self.clear_eye_fixations();
                         return None;
                     }
                     if self.selected_screen.is_some() && !self.selected_screen_is_current() {
                         return self.update_selected_screen(None);
                     }
                 }
-                let now = Instant::now();
                 let previous_quality = self.quality;
                 let was_enabled = self.pointer_enabled;
                 if (self.control_mode == ControlMode::Head
@@ -737,11 +793,19 @@ impl Runtime {
                             quality == Quality::Tracked
                                 && features.iter().all(|value| value.is_finite())
                         });
-                        if let Some(features) = features {
+                        if features.is_some() {
                             self.last_tracked = Some(now);
-                            self.recent.push_back((now, features));
                         } else {
                             self.point = None;
+                        }
+                        if let Some(capture) = self
+                            .session
+                            .as_mut()
+                            .and_then(|session| session.capture.as_mut())
+                        {
+                            let (sampled_at, sampled_timestamp) =
+                                sample_time(now, received_timestamp, timestamp);
+                            capture.track(now, sampled_at, sampled_timestamp, features);
                         }
                         action = if self.reset.is_some() {
                             self.advance_reset(now, timestamp, features)
@@ -750,13 +814,6 @@ impl Runtime {
                         };
                         if let Some(features) = features {
                             self.update_point(features, was_enabled);
-                        }
-                        while self
-                            .recent
-                            .front()
-                            .is_some_and(|(time, _)| now - *time > Duration::from_secs(2))
-                        {
-                            self.recent.pop_front();
                         }
                     }
                     ControlMode::Head => {
@@ -843,12 +900,21 @@ impl Runtime {
                 Some(MainAction::Exit(self.activation_generation))
             }
             Gesture::ResetCenter => {
+                self.disarm();
                 let Some(screen) = self.selected_screen else {
-                    self.message = Some("请选择可用的目标显示器，再快速校准。".into());
+                    self.message = Some("请选择可用的目标显示器，再开始九点校准。".into());
                     self.publish();
                     return None;
                 };
-                self.disarm();
+                if !self
+                    .mapping
+                    .as_ref()
+                    .is_some_and(|(calibrated, _)| *calibrated == screen)
+                {
+                    self.message = Some(RESET_NEEDS_CALIBRATION.into());
+                    self.publish();
+                    return None;
+                }
                 self.reset_sequence = self.reset_sequence.wrapping_add(1);
                 self.reset = Some(ResetSession::new(
                     self.reset_sequence,
@@ -877,18 +943,21 @@ impl Runtime {
         }
         if let Ok(samples) = <&[(Features, Point); 3]>::try_from(reset.samples.as_slice()) {
             let screen = reset.screen;
-            let previous = self
+            let result = self
                 .mapping
                 .as_ref()
-                .filter(|(previous_screen, _)| *previous_screen == screen)
-                .map(|(_, mapping)| mapping);
+                .filter(|(previous_screen, _)| {
+                    *previous_screen == screen && self.selected_screen == Some(screen)
+                })
+                .ok_or(RESET_NEEDS_CALIBRATION)
+                .and_then(|(_, mapping)| mapping.reset_center(samples));
             self.message = Some(
-                match Mapping::reset_center(previous, samples) {
+                match result {
                     Ok(mapping) => {
                         self.mapping = Some((screen, mapping));
                         self.validation = None;
                         self.point = None;
-                        "快速校准已完成。指针已暂停。"
+                        "视线已回正。指针已暂停。"
                     }
                     Err(error) => error,
                 }
@@ -900,6 +969,18 @@ impl Runtime {
         }
         self.publish();
         None
+    }
+
+    fn finish_calibration(
+        &mut self,
+        screen: Screen,
+        samples: &[(Features, Point)],
+    ) -> Result<(), &'static str> {
+        let mapping = Mapping::fit(samples)?;
+        self.mapping = Some((screen, mapping));
+        self.validation = None;
+        self.point = None;
+        Ok(())
     }
 
     fn update_point(&mut self, features: Features, was_enabled: bool) {
@@ -1086,7 +1167,7 @@ fn open_reset(app: &AppHandle, id: u32) {
         if macos::display_reconfiguring() {
             return Err(DISPLAY_RECONFIGURING.into());
         }
-        let window = window.as_ref().ok_or("无法打开快速校准窗口。")?;
+        let window = window.as_ref().ok_or("无法打开快速回正窗口。")?;
         app.show().map_err(|error| error.to_string())?;
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
@@ -1673,7 +1754,7 @@ async fn cancel_exercise(window: WebviewWindow) -> Result<(), String> {
             let resetting = runtime.reset.is_some();
             let action = runtime.cancel_exercises();
             if resetting {
-                runtime.message = Some("已取消快速校准。指针已暂停。".into());
+                runtime.message = Some("已取消快速回正。指针已暂停。".into());
                 runtime.publish();
             }
             action
@@ -1716,7 +1797,7 @@ fn reset_target_ready_on_main(window: &WebviewWindow, id: u32, index: usize) -> 
             return Err(DISPLAY_RECONFIGURING.into());
         }
         if !window.is_focused().map_err(|error| error.to_string())? {
-            return Err("快速校准窗口已失去焦点。".into());
+            return Err("快速回正窗口已失去焦点。".into());
         }
         macos::exercise_target(window, screen, point)
     })();
@@ -1753,10 +1834,10 @@ async fn capture_target(
         if session.capture.is_some() {
             return Err("正在采样。".into());
         }
-        session.capture = Some(started);
+        session.capture = Some(Capture::new(started));
     }
 
-    tokio::time::sleep(Duration::from_millis(960)).await;
+    tokio::time::sleep_until((started + CAPTURE_TIMEOUT).into()).await;
     let app = window.app_handle().clone();
     on_main(&app, move || finish_capture(&window, started)).await
 }
@@ -1770,19 +1851,19 @@ fn finish_capture(window: &WebviewWindow, started: Instant) -> Result<CaptureRes
         let session = runtime
             .session
             .as_ref()
-            .filter(|session| session.capture == Some(started))
+            .filter(|session| session.capturing(started))
             .ok_or("采样已取消。")?;
         (session.step().unwrap(), session.screen)
     };
     let target = macos::exercise_target(window, screen, step.point);
 
     let mut runtime = lock(&state);
-    let session = runtime
+    let capture = runtime
         .session
         .as_mut()
-        .filter(|session| session.capture == Some(started))
+        .filter(|session| session.capturing(started))
+        .and_then(|session| session.capture.take())
         .ok_or("采样已取消。")?;
-    session.capture = None;
     if macos::display_reconfiguring() {
         return Err(DISPLAY_RECONFIGURING.into());
     }
@@ -1804,20 +1885,10 @@ fn finish_capture(window: &WebviewWindow, started: Instant) -> Result<CaptureRes
             return Err(error);
         }
     };
-    let settled_at = started + Duration::from_millis(260);
-    let frames: Vec<&Features> = runtime
-        .recent
-        .iter()
-        .filter(|(time, _)| *time >= settled_at)
-        .map(|(_, features)| features)
-        .collect();
-    if frames.len() < 10 || !runtime.can_sample() {
-        return Err("有效采样不足。请持续注视当前目标，然后再按空格。".into());
-    }
-    let features = std::array::from_fn(|axis| {
-        let mut values: Vec<_> = frames.iter().map(|frame| frame[axis]).collect();
-        median(&mut values)
-    });
+    let features = capture
+        .sample()
+        .filter(|_| runtime.can_sample())
+        .ok_or("没有取得连续稳定的注视。请看准当前亮点，再按空格并保持视线。")?;
 
     let session = runtime.session.as_mut().unwrap();
     session.samples.push((features, target));
@@ -1829,15 +1900,10 @@ fn finish_capture(window: &WebviewWindow, started: Instant) -> Result<CaptureRes
     }
     let session = runtime.session.take().unwrap();
     let message = match session.mode {
-        Exercise::Calibrate => match Mapping::fit(&session.samples) {
-            Ok(mapping) => {
-                runtime.mapping = Some((screen, mapping));
-                runtime.validation = None;
-                runtime.point = None;
-                None
-            }
-            Err(error) => Some(error.to_owned()),
-        },
+        Exercise::Calibrate => runtime
+            .finish_calibration(screen, &session.samples)
+            .err()
+            .map(str::to_owned),
         Exercise::Verify => {
             let (_, mapping) = runtime.mapping.as_ref().ok_or("请先完成校准。")?;
             let errors = session
@@ -2014,7 +2080,7 @@ pub fn run() {
                     if !runtime.reset.as_ref().is_some_and(|reset| reset.visible) {
                         return;
                     }
-                    runtime.message = Some("快速校准窗口已失去焦点。".into());
+                    runtime.message = Some("快速回正窗口已失去焦点。".into());
                     let action = runtime.cancel_reset();
                     runtime.publish();
                     action
@@ -2293,7 +2359,7 @@ mod tests {
             mode: Exercise::Verify,
             screen: external,
             samples: Vec::new(),
-            capture: Some(Instant::now()),
+            capture: Some(Capture::new(Instant::now())),
         });
         runtime.exercise_frame = Some(WindowFrame::default());
         runtime.neutral = Some((external, [0.0; 2]));
@@ -2326,6 +2392,181 @@ mod tests {
         ]);
         assert_eq!(runtime.selected_screen, Some(revised));
         assert!(runtime.head_capture.is_none());
+    }
+
+    #[test]
+    fn manual_capture_uses_the_stable_end_of_the_sampling_window() {
+        let started = Instant::now();
+        let early = Some([0.45, 0.03, 0.0, 0.0]);
+        let settled = Some([0.50, 0.06, 0.0, 0.0]);
+        let mut capture = Capture::new(started);
+        for timestamp in (0..=1_500).step_by(50) {
+            let features = if (700..=1_400).contains(&timestamp) {
+                settled
+            } else {
+                early
+            };
+            let now = started + Duration::from_millis(timestamp);
+            capture.track(now, now, timestamp, features);
+        }
+        assert_eq!(capture.sample(), settled);
+
+        let mut interrupted = Capture::new(started);
+        for timestamp in (0..=1_400).step_by(50) {
+            let features = if timestamp == 1_100 { None } else { settled };
+            let now = started + Duration::from_millis(timestamp);
+            interrupted.track(now, now, timestamp, features);
+        }
+        assert_eq!(interrupted.sample(), None);
+        assert_eq!(Capture::new(started + CAPTURE_TIMEOUT).sample(), None);
+    }
+
+    #[test]
+    fn manual_capture_uses_the_camera_timestamp_for_settling_and_freshness() {
+        let started = Instant::now();
+        let epoch_ms = 10_000;
+        let features = Some([0.50, 0.06, 0.0, 0.0]);
+        let track = |capture: &mut Capture, receipt_ms, timestamp| {
+            let received_at = started + Duration::from_millis(receipt_ms);
+            let (sampled_at, bounded_timestamp) =
+                sample_time(received_at, epoch_ms + receipt_ms, timestamp);
+            capture.track(received_at, sampled_at, bounded_timestamp, features);
+        };
+
+        let mut delayed = Capture::new(started);
+        track(&mut delayed, 300, epoch_ms - 40);
+        track(&mut delayed, 500, epoch_ms + 160);
+        assert!(delayed.last_sample.is_none());
+        for sample_ms in (260..=1_010).step_by(50) {
+            track(&mut delayed, sample_ms + 340, epoch_ms + sample_ms);
+        }
+        assert_eq!(delayed.fixation.sample(), features);
+        assert_eq!(delayed.sample(), None);
+
+        let mut recent = Capture::new(started);
+        for sample_ms in (700..=1_350).step_by(50) {
+            track(&mut recent, sample_ms + 30, epoch_ms + sample_ms);
+        }
+        assert_eq!(recent.sample(), features);
+
+        assert_eq!(
+            sample_time(started, epoch_ms, epoch_ms + 150),
+            (started, epoch_ms)
+        );
+    }
+
+    #[test]
+    fn failed_nine_point_fit_preserves_an_existing_mapping_and_validation() {
+        let screen = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
+        let samples = CALIBRATION_POINTS.map(|point| (features(point), point));
+        let probe = features([0.40, 0.60]);
+        let mut runtime = Runtime::default();
+        runtime.finish_calibration(screen, &samples).unwrap();
+        let original = runtime.mapping.as_ref().unwrap().1.predict(probe);
+        runtime.validation = Some(Validation::new(vec![15.0]));
+        let misses = CALIBRATION_POINTS.map(|point| (features([0.5; 2]), point));
+
+        assert!(runtime.finish_calibration(screen, &misses).is_err());
+        assert!(runtime.validation.is_some());
+        assert_eq!(runtime.mapping.unwrap().1.predict(probe), original);
+    }
+
+    #[test]
+    fn three_blinks_requires_nine_point_calibration_on_the_selected_display() {
+        let screen = Screen::fixture(2, [-1920.0, 0.0], 1920.0, 1080.0);
+        let other = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
+        let samples = CALIBRATION_POINTS.map(|point| (features(point), point));
+        for calibration_screen in [None, Some(other), Some(screen)] {
+            let mut runtime = Runtime {
+                camera: Camera::Running,
+                selected_screen: Some(screen),
+                stream: Some(Channel::new(|_| Ok(()))),
+                pointer_enabled: calibration_screen == Some(screen),
+                ..Runtime::default()
+            };
+            if let Some(calibration_screen) = calibration_screen {
+                runtime
+                    .finish_calibration(calibration_screen, &samples)
+                    .unwrap();
+            }
+            let mut actions = Vec::new();
+            for frame in 0..22 {
+                let closed = matches!(frame, 3 | 4 | 9 | 10 | 15 | 16);
+                runtime.quality = if closed {
+                    Quality::EyesClosed
+                } else {
+                    Quality::Tracked
+                };
+                actions.extend(runtime.observe_gesture(
+                    frame * 45,
+                    (!closed).then(|| features([0.5; 2])),
+                    Some([0.0; 2]),
+                    closed,
+                ));
+            }
+            assert!(!runtime.pointer_enabled);
+            assert_eq!(
+                runtime.mapping.as_ref().map(|(screen, _)| *screen),
+                calibration_screen
+            );
+            if calibration_screen == Some(screen) {
+                assert!(matches!(actions.as_slice(), [MainAction::OpenReset(1)]));
+                assert_eq!(runtime.reset.unwrap().screen, screen);
+            } else {
+                assert!(actions.is_empty());
+                assert!(runtime.reset.is_none());
+                assert_eq!(runtime.message.as_deref(), Some(RESET_NEEDS_CALIBRATION));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_reset_only_replaces_the_mapping_and_validation_when_corners_agree() {
+        let started = Instant::now();
+        let screen = Screen::fixture(2, [-1920.0, 0.0], 1920.0, 1080.0);
+        let features = |[x, y]: Point| [0.61 - 0.24 * x, 0.02 + 0.16 * y, 0.0, 0.0];
+        let samples = CALIBRATION_POINTS.map(|point| (features(point), point));
+        let probe = features([0.55, 0.46]);
+        for span in [1.0, 0.27] {
+            let mut runtime = Runtime {
+                selected_screen: Some(screen),
+                stream: Some(Channel::new(|_| Ok(()))),
+                reset: Some(ResetSession::new(1, screen, started)),
+                exercise_frame: Some(WindowFrame::default()),
+                ..Runtime::default()
+            };
+            runtime.finish_calibration(screen, &samples).unwrap();
+            runtime.validation = Some(Validation::new(vec![15.0]));
+            let original = runtime.mapping.as_ref().unwrap().1.predict(probe);
+            let mut actions = Vec::new();
+            for (index, [x, y]) in RESET_POINTS.into_iter().enumerate() {
+                let ready_at = index as u64 * 1_300;
+                runtime.reset.as_mut().unwrap().target =
+                    Some(([x, y], started + Duration::from_millis(ready_at)));
+                let sample = features([0.55 + span * (x - 0.5), 0.46 + span * (y - 0.5)]);
+                for timestamp in (ready_at + 500..=ready_at + 1_175).step_by(45) {
+                    actions.extend(runtime.advance_reset(
+                        started + Duration::from_millis(timestamp),
+                        timestamp,
+                        Some(sample),
+                    ));
+                }
+            }
+            assert!(matches!(actions.as_slice(), [MainAction::CloseExercise]));
+            assert!(runtime.reset.is_none());
+            assert!(!runtime.pointer_enabled);
+            let updated = runtime.mapping.unwrap().1.predict(probe);
+            if span == 1.0 {
+                assert!(runtime.validation.is_none());
+                assert_eq!(updated, [0.5; 2]);
+            } else {
+                assert!(runtime.validation.is_some());
+                assert_eq!(updated, original);
+                assert!(runtime.message.unwrap().contains("九点校准"));
+            }
+        }
     }
 
     #[test]

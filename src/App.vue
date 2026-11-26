@@ -366,15 +366,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <div v-if="activeStep" ref="exercise" class="exercise" tabindex="-1" aria-label="全屏注视目标">
     <div class="exercise-bar">
-      <span>{{ resetStep ? '快速校准' : mode === 'calibrate' ? '九点校准' : '五点精度验证' }} <strong>{{ activeStep.index }} / {{ activeStep.total }}</strong></span>
+      <span>{{ resetStep ? '快速回正' : mode === 'calibrate' ? '九点校准' : '五点精度验证' }} <strong>{{ activeStep.index }} / {{ activeStep.total }}</strong></span>
       <button type="button" class="exercise-exit" @click="cancel">退出 <kbd>Esc</kbd></button>
     </div>
     <span class="exercise-dot" :class="{ sampling }" :style="coordinates(activeStep.point)" aria-hidden="true"></span>
     <div class="exercise-instruction" aria-live="polite">
-      <strong v-if="sampling">正在采样，请保持注视</strong>
+      <strong v-if="sampling">正在采样，请保持视线和头部稳定</strong>
       <strong v-else-if="!tracked">请让相机看到双眼</strong>
       <strong v-else-if="resetStep">注视{{ resetLocation }}的亮点，保持头部稳定</strong>
-      <strong v-else>看向亮点，按空格采样</strong>
+      <strong v-else>看准亮点后按空格采样</strong>
       <p v-if="notice">{{ notice }}</p>
     </div>
   </div>
@@ -486,7 +486,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div v-else class="control-row">
             <div>
               <h2>屏幕校准 <span v-if="state.calibrated" class="done">已完成</span></h2>
-              <p>逐个注视目标并按空格。移动相机或调整坐姿后可重新校准。</p>
+              <p>看准每个亮点后按空格，保持注视，等亮点切换。移动相机或调整坐姿后可重新校准。</p>
             </div>
             <div class="button-group">
               <button id="calibrate" type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!displayReady || !tracked || pending" @click="begin('calibrate', $event)">
@@ -517,7 +517,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <template v-if="!headControl">
                 <p>校准后头部保持稳定，眼睛依次看左 → 右 → 左 → 右，每边稍停，即可启用或暂停指针。</p>
                 <p>用视线逆时针画一圈可退出应用。</p>
-                <p>快速眨眼三次，依次注视中央、左上和右下的亮点。</p>
+                <p>完成九点校准后，可快速眨眼三次回正。依次注视中央、左上和右下的亮点。</p>
               </template>
             </div>
             <button v-if="state.pointerEnabled" type="button" class="button accent" :disabled="pending" @click="action('pause_pointer')">暂停指针</button>
