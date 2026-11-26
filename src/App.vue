@@ -27,6 +27,9 @@ interface Snapshot {
   pointerEnabled: boolean
   pointerAccess: PointerAccess
   pauseAvailable: boolean
+  refinementAvailable: boolean
+  refinementActive: boolean
+  refinementRevision: number
   point: Point | null
   validation: { medianPoints: number; p90Points: number } | null
   message: string | null
@@ -56,6 +59,9 @@ const state = ref<Omit<Snapshot, 'pointerAccess' | 'displays'> & { pointerAccess
   pointerEnabled: false,
   pointerAccess: null,
   pauseAvailable: true,
+  refinementAvailable: true,
+  refinementActive: false,
+  refinementRevision: 0,
   point: null,
   validation: null,
   message: null,
@@ -353,7 +359,10 @@ watch(() => resetStep.value && `${resetStep.value.id}:${resetStep.value.index}`,
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
   try {
-    const channel = new Channel<Snapshot>((snapshot) => { state.value = snapshot })
+    const channel = new Channel<Snapshot>((snapshot) => {
+      if (snapshot.refinementRevision !== state.value.refinementRevision) message.value = ''
+      state.value = snapshot
+    })
     await invoke('subscribe', { channel })
     connected.value = true
   } catch {
@@ -408,6 +417,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <header class="preview-header">
             <h2 id="preview-title">{{ headControl ? '头动方向预览' : '注视点预览' }}</h2>
             <span v-if="state.pointerEnabled" class="live-label"><i aria-hidden="true"></i>指针已启用</span>
+            <span v-else-if="state.refinementActive" class="preview-mode">正在局部校正</span>
             <span v-else class="preview-mode">指针暂停</span>
           </header>
           <div class="plot" aria-hidden="true">
@@ -518,11 +528,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 <p>校准后头部保持稳定，眼睛依次看左 → 右 → 左 → 右，每边稍停，即可启用或暂停指针。</p>
                 <p>用视线逆时针画一圈可退出应用。</p>
                 <p>完成九点校准后，可快速眨眼三次回正。依次注视中央、左上和右下的亮点。</p>
+                <p v-if="state.calibrated && state.refinementAvailable">看准目标约一秒后按 <kbd>⌃</kbd><kbd>⇧</kbd><kbd>M</kbd>，用鼠标移到目标，再按一次保存局部校正。</p>
+                <p v-else-if="state.calibrated && state.pauseAvailable">局部校正快捷键 <kbd>⌃</kbd><kbd>⇧</kbd><kbd>M</kbd> 不可用。释放该组合键后重启应用。</p>
               </template>
             </div>
-            <button v-if="state.pointerEnabled" type="button" class="button accent" :disabled="pending" @click="action('pause_pointer')">暂停指针</button>
+            <button v-if="state.pointerEnabled || state.refinementActive" type="button" class="button accent" :disabled="pending" @click="action('pause_pointer')">{{ state.refinementActive ? '取消局部校正' : '暂停指针' }}</button>
             <button v-else type="button" class="button" :class="{ accent: state.calibrated && tracked }" :disabled="!displayReady || !state.calibrated || !tracked || !state.pauseAvailable || pending" @click="action('enable_pointer')">启用指针</button>
-            <p v-if="!state.pauseAvailable" class="results">暂停快捷键不可用。释放该组合键后重启应用。</p>
+            <p v-if="!state.pauseAvailable" class="results">暂停快捷键 <kbd>⌃</kbd><kbd>⌥</kbd><kbd>P</kbd> 不可用。释放该组合键后重启应用。</p>
           </div>
         </section>
       </div>

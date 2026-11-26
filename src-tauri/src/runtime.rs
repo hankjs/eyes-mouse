@@ -4,6 +4,7 @@ use crate::calibration::{
 };
 use crate::gestures::{Detector, Eyes, Gesture, MAX_FRAME_GAP_MS};
 use crate::macos::{self, Display, Motion, MotionResult, Screen, WindowFrame};
+use crate::refinement::CorrectionError;
 use crate::snake;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,9 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1_400);
 const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const RESET_SETTLE: Duration = Duration::from_millis(500);
 const RESET_NEEDS_CALIBRATION: &str = "请先对当前显示器做九点校准，再用三次眨眼回正。";
+const REFINEMENT_TIMEOUT: Duration = Duration::from_secs(12);
+const REFINEMENT_EXPIRED: &str = "局部校正已超时。指针已暂停。";
+const REFINEMENT_NEEDS_GAZE: &str = "请看准目标约一秒，再按 ⌃⇧M。";
 const EYE_DAMPING_FILE: &str = "eye-damping.json";
 const CONTROL_MODE_FILE: &str = "control-mode.json";
 const LEGACY_IDENTIFIER: &str = "com.hankjs.eyesmouse";
@@ -199,6 +203,9 @@ struct Snapshot {
     pointer_enabled: bool,
     pointer_access: PointerAccess,
     pause_available: bool,
+    refinement_available: bool,
+    refinement_active: bool,
+    refinement_revision: u32,
     point: Option<Point>,
     validation: Option<Validation>,
     message: Option<String>,
@@ -273,6 +280,13 @@ fn sample_time(received_at: Instant, received_timestamp: u64, timestamp: u64) ->
     let timestamp = timestamp.min(received_timestamp);
     let age = Duration::from_millis(received_timestamp - timestamp);
     (received_at - age, timestamp)
+}
+
+fn timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[derive(Clone, Serialize)]
@@ -376,6 +390,13 @@ struct CaptureResult {
     message: Option<String>,
 }
 
+struct RefinementCapture {
+    screen: Screen,
+    features: Features,
+    expires: Instant,
+    resume_pointer: bool,
+}
+
 #[derive(Default)]
 struct Runtime {
     camera: Camera,
@@ -412,6 +433,11 @@ struct Runtime {
     pointer_access_request: u64,
     activation_generation: u64,
     pause_available: bool,
+    refinement_available: bool,
+    refinement_key_down: bool,
+    refinement_revision: u32,
+    refinement_fixation: Fixation,
+    refinement_capture: Option<RefinementCapture>,
     message: Option<String>,
     snake: snake::Status,
 }
@@ -438,6 +464,9 @@ impl Runtime {
             pointer_enabled: self.pointer_enabled,
             pointer_access: self.pointer_access,
             pause_available: self.pause_available,
+            refinement_available: self.refinement_available,
+            refinement_active: self.refinement_capture.is_some(),
+            refinement_revision: self.refinement_revision,
             point: self.point.filter(|_| self.quality == Quality::Tracked),
             validation: self
                 .validation
@@ -532,6 +561,9 @@ impl Runtime {
             return Err("请先结束校准或采样。".into());
         }
         self.pointer_access = current();
+        if self.pointer_access != PointerAccess::Granted && self.refinement_capture.is_some() {
+            self.disarm();
+        }
         if self.pointer_access == PointerAccess::Missing {
             self.disarm();
             self.pointer_access = PointerAccess::Waiting;
@@ -582,6 +614,11 @@ impl Runtime {
         self.head_motion_at = None;
         self.activation_generation = self.activation_generation.wrapping_add(1);
         self.gestures.clear_progress();
+        self.refinement_fixation.clear();
+        if self.refinement_capture.take().is_some() {
+            self.refinement_revision = self.refinement_revision.wrapping_add(1);
+            self.message = Some("局部校正已取消。指针已暂停。".into());
+        }
     }
 
     fn arm(&mut self) {
@@ -602,6 +639,7 @@ impl Runtime {
     }
 
     fn clear_eye_fixations(&mut self) {
+        self.refinement_fixation.clear();
         if let Some(capture) = self
             .session
             .as_mut()
@@ -709,6 +747,19 @@ impl Runtime {
             None
         };
         let mut changed = false;
+        if let Some(capture) = &self.refinement_capture {
+            if capture.expires <= Instant::now() {
+                self.disarm();
+                self.message = Some(REFINEMENT_EXPIRED.into());
+                changed = true;
+            } else if macos::display_reconfiguring() {
+                self.disarm();
+                changed = true;
+            } else if !macos::can_move_pointer() {
+                self.pointer_access_error();
+                changed = true;
+            }
+        }
         if self
             .last_frame
             .is_some_and(|time| time.elapsed() > STREAM_STALE)
@@ -721,6 +772,9 @@ impl Runtime {
                 self.point = None;
                 self.gestures.clear_progress();
                 self.clear_eye_fixations();
+                if self.refinement_capture.is_some() {
+                    self.disarm();
+                }
             }
             changed = true;
         }
@@ -753,10 +807,7 @@ impl Runtime {
                 bilateral_closed,
             } => {
                 let now = Instant::now();
-                let received_timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64;
+                let received_timestamp = timestamp_millis();
                 if received_timestamp.abs_diff(timestamp) > STREAM_STALE.as_millis() as u64 {
                     self.gestures.clear_progress();
                     self.clear_eye_fixations();
@@ -798,13 +849,21 @@ impl Runtime {
                         } else {
                             self.point = None;
                         }
+                        let (sampled_at, sampled_timestamp) =
+                            sample_time(now, received_timestamp, timestamp);
+                        if self.refinement_available
+                            && self.mapping.is_some()
+                            && self.refinement_capture.is_none()
+                            && !self.calibration_active()
+                        {
+                            self.refinement_fixation
+                                .observe(sampled_timestamp, features);
+                        }
                         if let Some(capture) = self
                             .session
                             .as_mut()
                             .and_then(|session| session.capture.as_mut())
                         {
-                            let (sampled_at, sampled_timestamp) =
-                                sample_time(now, received_timestamp, timestamp);
                             capture.track(now, sampled_at, sampled_timestamp, features);
                         }
                         action = if self.reset.is_some() {
@@ -845,6 +904,7 @@ impl Runtime {
             && self.control_mode == ControlMode::Eye
             && self.stream.is_some()
             && !self.calibration_active()
+            && self.refinement_capture.is_none()
             && !self.pointer_access.in_progress()
             && !self.exiting
     }
@@ -988,9 +1048,7 @@ impl Runtime {
             return;
         };
         let screen = *screen;
-        let mut point = mapping
-            .predict(features)
-            .map(|position| position.clamp(0.0, 1.0));
+        let mut point = mapping.pointer_point(features);
         if let Some(last) = self.point {
             let distance = (point[0] - last[0]).hypot(point[1] - last[1]);
             let weight = self.eye_damping.weight(distance);
@@ -1002,6 +1060,114 @@ impl Runtime {
         if self.pointer_enabled && was_enabled {
             self.move_pointer(screen, Motion::Eye(point));
         }
+    }
+
+    fn refinement_key_pressed(&mut self, state: ShortcutState) -> bool {
+        let pressed = state == ShortcutState::Pressed;
+        let was_pressed = std::mem::replace(&mut self.refinement_key_down, pressed);
+        self.refinement_available && pressed && !was_pressed
+    }
+
+    fn handle_refinement_shortcut(&mut self, state: ShortcutState) {
+        if !self.refinement_key_pressed(state) {
+            return;
+        }
+        let revision = self.refinement_revision.wrapping_add(1);
+        if let Err(message) = self.toggle_refinement() {
+            if self.refinement_capture.is_some() {
+                self.disarm();
+            }
+            self.message = Some(message.into());
+        }
+        self.refinement_revision = revision;
+        self.publish();
+    }
+
+    fn toggle_refinement(&mut self) -> Result<(), &'static str> {
+        if self.control_mode != ControlMode::Eye
+            || self.camera != Camera::Running
+            || self
+                .last_frame
+                .is_none_or(|time| time.elapsed() > STREAM_STALE)
+            || self.calibration_active()
+            || self.exiting
+            || self.stream.is_none()
+        {
+            return Err("请先在眼动模式完成校准，并保持摄像头开启。");
+        }
+        if self.pointer_access.in_progress() {
+            return Err("请先完成辅助功能授权或取消等待。");
+        }
+        if !macos::can_move_pointer() {
+            self.pointer_access = PointerAccess::without_post_access();
+            return Err("请先在主窗口授权辅助功能。");
+        }
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING);
+        }
+        let screen = self.selected_screen.ok_or("请选择可用的目标显示器。")?;
+        let cursor = screen
+            .cursor_point(self.preferred_display_id.is_none())
+            .ok_or("请确认指针位于当前控制屏幕，再重试局部校正。")?;
+        let now = Instant::now();
+        self.advance_refinement(screen, cursor, now, timestamp_millis())
+    }
+
+    fn advance_refinement(
+        &mut self,
+        screen: Screen,
+        cursor: Point,
+        now: Instant,
+        timestamp: u64,
+    ) -> Result<(), &'static str> {
+        let (_, mapping) = self
+            .mapping
+            .as_mut()
+            .filter(|(calibrated_screen, _)| *calibrated_screen == screen)
+            .ok_or("请先对当前控制屏幕做九点校准。")?;
+        if let Some(capture) = self.refinement_capture.take() {
+            if capture.expires <= now {
+                return Err(REFINEMENT_EXPIRED);
+            }
+            if capture.screen != screen {
+                return Err("控制屏幕已改变。请重新开始局部校正。");
+            }
+            mapping
+                .refine(capture.features, cursor)
+                .map_err(|error| match error {
+                    CorrectionError::InvalidPoint => "未取得有效的校正位置。请重试。",
+                    CorrectionError::TooFar => "校正偏差过大。请看准目标重试，或重新做九点校准。",
+                    CorrectionError::ConflictsWithSample => {
+                        "这次校正与附近已保存的位置冲突。请看准目标重试。"
+                    }
+                })?;
+            self.validation = None;
+            self.point = Some(cursor);
+            if capture.resume_pointer && self.pause_available && self.can_sample() {
+                // The cursor is already on the selected screen. Arming here never warps it.
+                self.arm();
+                self.message = Some("已学习这处校正，眼动指针已恢复。".into());
+            } else {
+                self.message = Some("已学习这处校正。指针保持暂停。".into());
+            }
+        } else {
+            let features = self
+                .refinement_fixation
+                .recent_sample(timestamp)
+                .filter(|_| self.can_sample())
+                .ok_or(REFINEMENT_NEEDS_GAZE)?;
+            let resume_pointer = self.pointer_enabled;
+            self.disarm();
+            self.refinement_capture = Some(RefinementCapture {
+                screen,
+                features,
+                expires: now + REFINEMENT_TIMEOUT,
+                resume_pointer,
+            });
+            self.message =
+                Some("用鼠标或触控板把指针移到目标，再按 ⌃⇧M 保存。按 ⌃⌥P 取消。".into());
+        }
+        Ok(())
     }
 
     fn track_head(&mut self, pose: HeadPose, now: Instant) {
@@ -1107,7 +1273,7 @@ fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
             handle.exit(0);
         }
         MainAction::RestartForPointerAccess => {
-            let unregister_pause = {
+            {
                 let state = handle.state::<Shared>();
                 let mut runtime = lock(&state);
                 if runtime.exiting || runtime.pointer_access != PointerAccess::Restarting {
@@ -1116,12 +1282,9 @@ fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
                 runtime.exiting = true;
                 // Reap the tracker even if Tauri falls back to restarting without an Exit event.
                 runtime.stop(None);
-                runtime.pause_available
-            };
-            if unregister_pause {
-                // LaunchServices can start the new process before this process has exited.
-                let _ = handle.global_shortcut().unregister(pause_shortcut());
             }
+            // LaunchServices can start the new process before this process has exited.
+            let _ = handle.global_shortcut().unregister_all();
             lock(&handle.state::<PermissionChecks>()).close();
             handle.request_restart();
         }
@@ -1467,6 +1630,9 @@ fn enable_pointer(window: WebviewWindow, state: State<'_, Shared>) -> Result<(),
 }
 
 fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
+    if runtime.refinement_capture.is_some() {
+        return Err("请先保存或取消局部校正。".into());
+    }
     if runtime.pointer_access.in_progress() {
         return Err("请先完成辅助功能授权或取消等待。".into());
     }
@@ -1910,9 +2076,9 @@ fn finish_capture(window: &WebviewWindow, started: Instant) -> Result<CaptureRes
                 .samples
                 .into_iter()
                 .map(|(features, target)| {
-                    let point = mapping.predict(features);
-                    ((point[0] - target[0]) * screen.width)
-                        .hypot((point[1] - target[1]) * screen.height)
+                    let point = mapping.pointer_point(features);
+                    ((point[0] - target[0]) * (screen.width - 1.0))
+                        .hypot((point[1] - target[1]) * (screen.height - 1.0))
                 })
                 .collect();
             runtime.validation = Some(Validation::new(errors));
@@ -1935,6 +2101,10 @@ fn pause_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP)
 }
 
+fn refinement_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyM)
+}
+
 fn cancel_pointer_access_on_exit(app: &AppHandle) {
     {
         let state = app.state::<Shared>();
@@ -1947,6 +2117,7 @@ fn cancel_pointer_access_on_exit(app: &AppHandle) {
 
 pub fn run() {
     let shortcut = pause_shortcut();
+    let refine = refinement_shortcut();
     tauri::Builder::default()
         .manage(Shared::default())
         .manage(PermissionChecks::default())
@@ -1956,6 +2127,9 @@ pub fn run() {
                 .with_handler(move |app, key, event| {
                     if *key == shortcut && event.state() == ShortcutState::Pressed {
                         pause_pointer(app.state());
+                    } else if *key == refine {
+                        let state = app.state::<Shared>();
+                        lock(&state).handle_refinement_shortcut(event.state());
                     }
                 })
                 .build(),
@@ -1964,9 +2138,12 @@ pub fn run() {
             macos::watch_display_changes();
             refresh_displays(app.handle());
             let registered = app.global_shortcut().register(shortcut).is_ok();
+            let refinement_registered =
+                registered && app.global_shortcut().register(refine).is_ok();
             let state = app.state::<Shared>();
             let mut runtime = lock(&state);
             runtime.pause_available = registered;
+            runtime.refinement_available = refinement_registered;
             runtime.pointer_access = PointerAccess::current();
             if let (Ok(config), Ok(config_root)) =
                 (app.path().app_config_dir(), app.path().config_dir())
@@ -2470,6 +2647,123 @@ mod tests {
         assert!(runtime.finish_calibration(screen, &misses).is_err());
         assert!(runtime.validation.is_some());
         assert_eq!(runtime.mapping.unwrap().1.predict(probe), original);
+    }
+
+    #[test]
+    fn local_correction_requires_recent_gaze_and_a_second_keypress() {
+        let now = Instant::now();
+        let screen = Screen::fixture(2, [-1920.0, 0.0], 1920.0, 1080.0);
+        let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
+        let mut runtime = Runtime {
+            camera: Camera::Running,
+            quality: Quality::Tracked,
+            last_tracked: Some(now),
+            stream: Some(Channel::new(|_| Ok(()))),
+            selected_screen: Some(screen),
+            pointer_enabled: true,
+            pause_available: true,
+            refinement_available: true,
+            ..Runtime::default()
+        };
+        runtime
+            .finish_calibration(
+                screen,
+                &CALIBRATION_POINTS.map(|point| (features(point), point)),
+            )
+            .unwrap();
+        runtime.validation = Some(Validation::new(vec![15.0]));
+        let target = features([0.42, 0.58]);
+        for timestamp in (100..=800).step_by(50) {
+            runtime.refinement_fixation.observe(timestamp, Some(target));
+        }
+        let initial = runtime.mapping.as_ref().unwrap().1.pointer_point(target);
+        assert_eq!(
+            runtime.advance_refinement(screen, initial, now, 800 + MAX_FRAME_GAP_MS + 1),
+            Err(REFINEMENT_NEEDS_GAZE)
+        );
+        assert!(runtime.pointer_enabled);
+        assert!(runtime.gesture_available());
+        assert!(runtime.refinement_key_pressed(ShortcutState::Pressed));
+        runtime
+            .advance_refinement(screen, initial, now, 810)
+            .unwrap();
+        assert!(!runtime.pointer_enabled);
+        assert!(!runtime.gesture_available());
+        assert!(!runtime.refinement_key_pressed(ShortcutState::Pressed));
+        assert!(!runtime.refinement_key_pressed(ShortcutState::Released));
+        assert!(runtime.refinement_key_pressed(ShortcutState::Pressed));
+
+        let cursor = [0.49, 0.54];
+        runtime
+            .advance_refinement(screen, cursor, now, 1_400)
+            .unwrap();
+        let point = runtime.mapping.as_ref().unwrap().1.pointer_point(target);
+        assert!((point[0] - cursor[0]).hypot(point[1] - cursor[1]) < 1e-12);
+        assert!(runtime.refinement_capture.is_none());
+        assert!(runtime.validation.is_none());
+        assert!(runtime.pointer_enabled);
+    }
+
+    #[test]
+    fn each_refinement_shortcut_outcome_has_a_distinct_revision() {
+        let mut runtime = Runtime {
+            refinement_available: true,
+            ..Runtime::default()
+        };
+        runtime.handle_refinement_shortcut(ShortcutState::Pressed);
+        assert_eq!(runtime.refinement_revision, 1);
+        assert!(runtime.refinement_capture.is_none());
+        let retry_message = runtime.message.clone().unwrap();
+
+        runtime.handle_refinement_shortcut(ShortcutState::Pressed);
+        runtime.handle_refinement_shortcut(ShortcutState::Released);
+        assert_eq!(runtime.refinement_revision, 1);
+
+        runtime.handle_refinement_shortcut(ShortcutState::Pressed);
+        assert_eq!(runtime.refinement_revision, 2);
+        assert_eq!(runtime.message.as_deref(), Some(retry_message.as_str()));
+    }
+
+    #[test]
+    fn local_correction_cancels_without_recording_or_resuming() {
+        let now = Instant::now();
+        let screen = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
+        let samples = CALIBRATION_POINTS.map(|point| (features(point), point));
+        let target = features([0.5, 0.5]);
+        let mut runtime = Runtime {
+            camera: Camera::Running,
+            quality: Quality::Tracked,
+            last_tracked: Some(now),
+            selected_screen: Some(screen),
+            pointer_enabled: true,
+            ..Runtime::default()
+        };
+        runtime.finish_calibration(screen, &samples).unwrap();
+        let initial = runtime.mapping.as_ref().unwrap().1.pointer_point(target);
+        for timed_out in [false, true] {
+            for timestamp in (100..=800).step_by(50) {
+                runtime.refinement_fixation.observe(timestamp, Some(target));
+            }
+            runtime
+                .advance_refinement(screen, initial, now, 810)
+                .unwrap();
+            let revision = runtime.refinement_revision;
+            if timed_out {
+                runtime.refinement_capture.as_mut().unwrap().expires = now;
+                runtime.watchdog();
+                assert_eq!(runtime.message.as_deref(), Some(REFINEMENT_EXPIRED));
+            } else {
+                runtime.disarm();
+            }
+            assert!(runtime.refinement_capture.is_none());
+            assert_eq!(runtime.refinement_revision, revision + 1);
+            assert!(!runtime.pointer_enabled);
+            assert_eq!(
+                runtime.mapping.as_ref().unwrap().1.pointer_point(target),
+                initial
+            );
+        }
     }
 
     #[test]

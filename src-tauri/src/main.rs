@@ -1,6 +1,7 @@
 mod calibration;
 mod gestures;
 mod macos;
+mod refinement;
 mod runtime;
 mod snake;
 

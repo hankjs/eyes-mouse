@@ -1,3 +1,4 @@
+use crate::refinement::{CorrectionError, Refinement};
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -38,6 +39,8 @@ pub struct Mapping {
     scale: Features,
     coefficients: [Point; 5],
     offset: Point,
+    pointer_offset: Point,
+    refinement: Refinement,
     eye_pose: Point,
 }
 
@@ -81,6 +84,8 @@ impl Mapping {
             scale,
             coefficients: [[0.0; 2]; 5],
             offset: [0.0; 2],
+            pointer_offset: [0.0; 2],
+            refinement: Refinement::default(),
             eye_pose: [center[2], center[3]],
         };
         let mut equations = [[0.0; 7]; 5];
@@ -124,37 +129,53 @@ impl Mapping {
             return Err(RESET_ERROR);
         }
 
-        // Measure each recentering against the nine-point fit itself.
-        let [x, y] = self.predict_linear(center);
-        let offset = [target[0] - x, target[1] - y];
-        if !within_distance(offset, [0.0; 2], MAX_RESET_SHIFT) {
+        // Use the nine-point fit for gestures and the locally corrected fit for the pointer.
+        let base = self.predict_linear(center);
+        let corrected = self.refinement.correct(base);
+        let offset = std::array::from_fn(|axis| target[axis] - base[axis]);
+        let pointer_offset = std::array::from_fn(|axis| target[axis] - corrected[axis]);
+        if !within_distance(offset, [0.0; 2], MAX_RESET_SHIFT)
+            || !within_distance(pointer_offset, [0.0; 2], MAX_RESET_SHIFT)
+        {
             return Err(RESET_ERROR);
         }
         let mut mapping = self.clone();
         mapping.offset = offset;
+        mapping.pointer_offset = pointer_offset;
         mapping.eye_pose = [center[2], center[3]];
-        let mut corner_offsets = [[0.0; 2]; 2];
+        let translations = [
+            (offset, self.offset),
+            (offset, self.offset),
+            (pointer_offset, self.pointer_offset),
+        ];
+        let mut corner_offsets = [[0.0; 2]; 3];
         for &(features, target) in &samples[1..] {
-            // Corners must agree with the translated fit even with the head held at center pose.
-            let point = mapping.predict(features);
-            let eye_point = mapping.eye_point(features);
-            if !within_distance(point, target, MAX_RESET_CORNER_ERROR)
-                || !within_distance(eye_point, target, MAX_RESET_CORNER_ERROR)
+            // Check the base fit, the center-pose eye prediction and the unclamped pointer.
+            let predictions = [
+                mapping.predict(features),
+                mapping.eye_point(features),
+                mapping.unclamped_pointer_point(features),
+            ];
+            for ((corner_offset, prediction), (translation, _)) in
+                corner_offsets.iter_mut().zip(predictions).zip(translations)
             {
-                return Err(RESET_ERROR);
-            }
-            for (corner_offset, prediction) in corner_offsets.iter_mut().zip([point, eye_point]) {
+                if !within_distance(prediction, target, MAX_RESET_CORNER_ERROR) {
+                    return Err(RESET_ERROR);
+                }
                 for axis in 0..2 {
-                    corner_offset[axis] += (target[axis] - prediction[axis] + offset[axis]) / 2.0;
+                    corner_offset[axis] +=
+                        (target[axis] - prediction[axis] + translation[axis]) / 2.0;
                 }
             }
         }
         // The mean corner offset minimizes the squared error for a common translation.
         // Allow small differences from it, and require larger differences to improve the fit.
-        if corner_offsets.into_iter().any(|corner_offset| {
-            let new_error = distance(offset, corner_offset);
-            new_error > RESET_CORNER_NOISE && new_error >= distance(self.offset, corner_offset)
-        }) {
+        if corner_offsets.into_iter().zip(translations).any(
+            |(corner_offset, (current, previous))| {
+                let error = distance(current, corner_offset);
+                error > RESET_CORNER_NOISE && error >= distance(previous, corner_offset)
+            },
+        ) {
             return Err(RESET_ERROR);
         }
         Ok(mapping)
@@ -176,6 +197,22 @@ impl Mapping {
     pub fn eye_point(&self, mut features: Features) -> Point {
         features[2..].copy_from_slice(&self.eye_pose);
         self.predict(features)
+    }
+
+    pub fn pointer_point(&self, features: Features) -> Point {
+        self.unclamped_pointer_point(features)
+            .map(|axis| axis.clamp(0.0, 1.0))
+    }
+
+    pub fn refine(&mut self, features: Features, confirmed: Point) -> Result<(), CorrectionError> {
+        let predicted = self.predict_linear(features);
+        self.refinement
+            .record(predicted, confirmed, self.pointer_offset)
+    }
+
+    fn unclamped_pointer_point(&self, features: Features) -> Point {
+        let point = self.refinement.correct(self.predict_linear(features));
+        std::array::from_fn(|axis| point[axis] + self.pointer_offset[axis])
     }
 
     fn predict_linear(&self, features: Features) -> Point {
@@ -258,6 +295,13 @@ impl Fixation {
             median(&mut values)
         }))
     }
+
+    pub fn recent_sample(&self, timestamp: u64) -> Option<Features> {
+        if timestamp.abs_diff(self.frames.back()?.0) > crate::gestures::MAX_FRAME_GAP_MS {
+            return None;
+        }
+        self.sample()
+    }
 }
 
 fn solve(mut matrix: [[f64; 7]; 5]) -> Option<[Point; 5]> {
@@ -311,6 +355,63 @@ impl Validation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_a_learned_center_shift_that_would_worsen_both_pointer_corners() {
+        let features = |[x, y]: Point| [0.61 - 0.24 * x, 0.02 + 0.16 * y, 0.0, 0.0];
+        let mut mapping =
+            Mapping::fit(&CALIBRATION_POINTS.map(|point| (features(point), point))).unwrap();
+        let anchors = RESET_POINTS.map(|point| (features(point), point));
+        let corners = [anchors[1].0, anchors[2].0];
+        let before = corners.map(|features| mapping.pointer_point(features));
+        assert!(mapping.reset_center(&anchors).is_ok());
+
+        let center = [0.60, 0.50];
+        mapping.refine(anchors[0].0, center).unwrap();
+        assert!(mapping.reset_center(&anchors).is_err());
+        assert_eq!(
+            corners.map(|features| mapping.pointer_point(features)),
+            before
+        );
+        assert_eq!(mapping.pointer_point(anchors[0].0), center);
+    }
+
+    #[test]
+    fn local_corrections_survive_recenter_and_keep_gesture_coordinates_independent() {
+        let features = |[x, y]: Point| [0.61 - 0.24 * x, 0.02 + 0.16 * y, 0.0, 0.0];
+        let full = Mapping::fit(&CALIBRATION_POINTS.map(|point| (features(point), point))).unwrap();
+        let mut learned = full.clone();
+        let center = features([0.56, 0.51]);
+        let outlying = features([0.73, 0.42]);
+        let center_confirmed = [0.59, 0.50];
+        let outlying_confirmed = [0.76, 0.42];
+        learned.refine(center, center_confirmed).unwrap();
+        learned.refine(outlying, outlying_confirmed).unwrap();
+        assert!(within_distance(
+            learned.pointer_point(center),
+            center_confirmed,
+            1e-12
+        ));
+        assert_eq!(learned.eye_point(center), full.eye_point(center));
+
+        let anchors = RESET_POINTS.map(|[x, y]| (features([x + 0.06, y + 0.01]), [x, y]));
+        let recentered = learned.reset_center(&anchors).unwrap();
+        let unlearned = full.reset_center(&anchors).unwrap();
+        assert!(within_distance(
+            recentered.pointer_point(center),
+            [0.5; 2],
+            1e-12
+        ));
+        assert_eq!(
+            recentered.eye_point(outlying),
+            unlearned.eye_point(outlying)
+        );
+        assert!(within_distance(
+            recentered.pointer_point(outlying),
+            [0.67, 0.42],
+            1e-12
+        ));
+    }
 
     #[test]
     fn fits_known_gaze_mapping_at_an_unseen_position() {
@@ -417,6 +518,8 @@ mod tests {
             scale: [10.0, 10.0, 1.0, 1.0],
             coefficients: [[0.5, 0.5], [-1.0, 0.0], [0.0, 1.0], [2.0, 0.0], [0.0, 2.0]],
             offset: [0.0; 2],
+            pointer_offset: [0.0; 2],
+            refinement: Refinement::default(),
             eye_pose: [0.0; 2],
         };
         let anchors = [

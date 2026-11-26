@@ -160,6 +160,16 @@ impl Screen {
         ]
     }
 
+    fn normalized_position(self, position: Point) -> Option<Point> {
+        if !self.contains(position) {
+            return None;
+        }
+        Some([
+            ((position[0] - self.origin[0]) / (self.width - 1.0)).clamp(0.0, 1.0),
+            ((position[1] - self.origin[1]) / (self.height - 1.0)).clamp(0.0, 1.0),
+        ])
+    }
+
     fn constrain(self, [x, y]: Point) -> Point {
         let [left, top] = self.origin;
         [
@@ -180,10 +190,18 @@ impl Screen {
         }
     }
 
+    pub fn cursor_point(self, follow_primary: bool) -> Option<Point> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+        let position = pointer_position(source).ok()?;
+        if !self.is_current(follow_primary) || display_reconfiguring() {
+            return None;
+        }
+        self.normalized_position(position)
+    }
+
     pub fn move_pointer(self, motion: Motion, follow_primary: bool) -> Result<MotionResult, ()> {
         let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)?;
-        let cursor = CGEvent::new(source.clone())?.location();
-        let position = [cursor.x, cursor.y];
+        let position = pointer_position(source.clone())?;
         let current = self.is_current(follow_primary);
         if display_reconfiguring() {
             return Ok(MotionResult::Reconfiguring);
@@ -352,6 +370,11 @@ pub fn exercise_target(
     }
 }
 
+fn pointer_position(source: CGEventSource) -> Result<Point, ()> {
+    let cursor = CGEvent::new(source)?.location();
+    Ok([cursor.x, cursor.y])
+}
+
 fn post_pointer_move(source: CGEventSource, position: CGPoint) -> Result<(), ()> {
     let event = CGEvent::new_mouse_event(
         source,
@@ -516,5 +539,20 @@ mod tests {
             screen.pointer_target(outside, Motion::Activate),
             Some([-960.5, 389.5])
         );
+    }
+
+    #[test]
+    fn normalizes_cursor_positions_on_the_selected_display() {
+        let screen = Screen::fixture(2, [-1920.0, -150.0], 1920.0, 1080.0);
+        for point in [[0.0, 0.0], [0.5, 0.25], [1.0, 1.0]] {
+            assert_eq!(
+                screen.normalized_position(screen.position_for(point)),
+                Some(point)
+            );
+        }
+        assert_eq!(screen.normalized_position([-0.5, 929.5]), Some([1.0, 1.0]));
+        for point in [[0.0, 300.0], [-1920.1, 300.0], [-1200.0, 930.0]] {
+            assert_eq!(screen.normalized_position(point), None);
+        }
     }
 }
