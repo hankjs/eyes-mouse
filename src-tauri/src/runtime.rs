@@ -1,6 +1,8 @@
 use crate::calibration::{
-    median, Features, Mapping, Point, Validation, CALIBRATION_POINTS, VALIDATION_POINTS,
+    median, reset_corner, Features, Fixation, Mapping, Point, Validation, CALIBRATION_POINTS,
+    RESET_POINTS, VALIDATION_POINTS,
 };
+use crate::gestures::{Detector, Eyes, Gesture};
 use crate::macos::{self, Screen};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -22,6 +24,8 @@ const HEAD_MAX_FRAME_TIME: Duration = Duration::from_millis(64);
 const HEAD_CAPTURE_SETTLE: Duration = Duration::from_millis(250);
 const HEAD_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEAD_CAPTURE_SAMPLES: usize = 8;
+const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
+const RESET_SETTLE: Duration = Duration::from_millis(500);
 
 type HeadPose = [f64; 2];
 
@@ -79,6 +83,8 @@ enum Packet {
         quality: Quality,
         features: Option<Features>,
         pose: Option<HeadPose>,
+        #[serde(default)]
+        bilateral_closed: bool,
     },
     Error {
         message: String,
@@ -97,6 +103,7 @@ struct Snapshot {
     point: Option<Point>,
     validation: Option<Validation>,
     message: Option<String>,
+    reset_exercise: Option<ResetStep>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -122,11 +129,84 @@ struct Session {
     capture: Option<Instant>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct Step {
     point: Point,
     index: usize,
     total: usize,
+}
+
+#[derive(Clone, Serialize)]
+struct ResetStep {
+    id: u32,
+    #[serde(flatten)]
+    step: Step,
+}
+
+struct ResetSession {
+    id: u32,
+    screen: Screen,
+    visible: bool,
+    expires: Instant,
+    target: Option<(Point, Instant)>,
+    samples: Vec<(Features, Point)>,
+    fixation: Fixation,
+}
+
+impl ResetSession {
+    fn new(id: u32, screen: Screen, now: Instant) -> Self {
+        Self {
+            id,
+            screen,
+            visible: false,
+            expires: now + RESET_TARGET_TIMEOUT,
+            target: None,
+            samples: Vec::new(),
+            fixation: Fixation::default(),
+        }
+    }
+
+    fn step(&self) -> Option<ResetStep> {
+        Some(ResetStep {
+            id: self.id,
+            step: Step {
+                point: *RESET_POINTS.get(self.samples.len())?,
+                index: self.samples.len() + 1,
+                total: RESET_POINTS.len(),
+            },
+        })
+    }
+
+    fn track(&mut self, now: Instant, timestamp: u64, features: Option<Features>) -> bool {
+        let Some((target, ready)) = self.target else {
+            return false;
+        };
+        let Some(features) = features.filter(|features| {
+            self.samples
+                .first()
+                .is_none_or(|(center, _)| reset_corner(*center, *features, self.samples.len()))
+        }) else {
+            self.fixation.clear();
+            return false;
+        };
+        if now - ready < RESET_SETTLE {
+            return false;
+        }
+        let Some(sample) = self.fixation.observe(timestamp, features) else {
+            return false;
+        };
+        self.samples.push((sample, target));
+        self.target = None;
+        self.fixation.clear();
+        self.expires = now + RESET_TARGET_TIMEOUT;
+        true
+    }
+}
+
+enum MainAction {
+    OpenReset(u32),
+    CloseReset(u32),
+    Exit(u64),
 }
 
 impl Session {
@@ -163,6 +243,12 @@ struct Runtime {
     head_motion_at: Option<Instant>,
     stream: Option<Channel<Snapshot>>,
     session: Option<Session>,
+    closing_exercise: bool,
+    gestures: Detector,
+    reset_sequence: u32,
+    reset: Option<ResetSession>,
+    reset_fullscreen: Option<u32>,
+    exiting: bool,
     mapping: Option<(Screen, Mapping)>,
     validation: Option<Validation>,
     point: Option<Point>,
@@ -193,6 +279,11 @@ impl Runtime {
                 .validation
                 .filter(|_| self.control_mode == ControlMode::Eye),
             message: self.message.clone(),
+            reset_exercise: self
+                .reset
+                .as_ref()
+                .filter(|reset| reset.visible)
+                .and_then(ResetSession::step),
         };
         if let Some(channel) = &self.stream {
             if channel.send(snapshot).is_err() {
@@ -213,6 +304,14 @@ impl Runtime {
         self.pointer_enabled = false;
         self.head_motion_at = None;
         self.activation_generation = self.activation_generation.wrapping_add(1);
+        self.gestures.clear_progress();
+    }
+
+    fn arm(&mut self) {
+        self.disarm();
+        self.pointer_enabled = true;
+        self.head_motion_at = Some(Instant::now());
+        self.message = None;
     }
 
     fn clear_tracking(&mut self, quality: Quality) {
@@ -233,8 +332,22 @@ impl Runtime {
                 .is_some_and(|time| time.elapsed() < STREAM_STALE)
     }
 
-    fn stop(&mut self, message: Option<String>) {
+    fn calibration_active(&self) -> bool {
+        self.session.is_some()
+            || self.closing_exercise
+            || self.reset.is_some()
+            || self.reset_fullscreen.is_some()
+    }
+
+    fn cancel_reset(&mut self) -> Option<MainAction> {
+        self.reset.take()?;
+        self.gestures.clear_progress();
+        self.reset_fullscreen.map(MainAction::CloseReset)
+    }
+
+    fn stop(&mut self, message: Option<String>) -> Option<MainAction> {
         self.generation = self.generation.wrapping_add(1);
+        let action = self.cancel_reset();
         if let Some(mut child) = self.child.take() {
             // Let the PyInstaller bootloader forward the signal and remove its temporary files.
             unsafe {
@@ -263,20 +376,32 @@ impl Runtime {
         };
         self.message = message;
         self.publish();
+        action
     }
 
-    fn watchdog(&mut self) {
+    fn watchdog(&mut self) -> Option<MainAction> {
         if self.camera == Camera::Starting
             && self
                 .camera_started
                 .is_some_and(|time| time.elapsed() > Duration::from_secs(45))
         {
-            self.stop(Some("相机启动超时。请检查系统相机权限，然后重试。".into()));
-            return;
+            return self.stop(Some("相机启动超时。请检查系统相机权限，然后重试。".into()));
         }
         if self.camera != Camera::Running {
-            return;
+            return None;
         }
+        let action = if self
+            .reset
+            .as_ref()
+            .is_some_and(|reset| reset.expires <= Instant::now() || self.stream.is_none())
+        {
+            self.message = Some("快速校准超时。请在相机中保持双眼可见，再眨眼三次重试。".into());
+            let action = self.cancel_reset();
+            self.publish();
+            action
+        } else {
+            None
+        };
         let mut changed = false;
         if self
             .last_frame
@@ -288,6 +413,10 @@ impl Runtime {
             } else {
                 self.quality = Quality::Stale;
                 self.point = None;
+                self.gestures.clear_progress();
+                if let Some(reset) = &mut self.reset {
+                    reset.fixation.clear();
+                }
             }
             changed = true;
         }
@@ -301,21 +430,23 @@ impl Runtime {
         if changed {
             self.publish();
         }
+        action
     }
 
-    fn accept(&mut self, packet: Packet) {
+    fn accept(&mut self, packet: Packet) -> Option<MainAction> {
         match packet {
             Packet::Ready => {
                 self.camera = Camera::Running;
                 self.last_frame = Some(Instant::now());
                 self.publish();
             }
-            Packet::Error { message } => self.stop(Some(message)),
+            Packet::Error { message } => return self.stop(Some(message)),
             Packet::Sample {
                 timestamp,
                 quality,
                 features,
                 pose,
+                bilateral_closed,
             } => {
                 let elapsed = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -323,7 +454,11 @@ impl Runtime {
                 if (elapsed.as_millis() as u64).abs_diff(timestamp)
                     > STREAM_STALE.as_millis() as u64
                 {
-                    return;
+                    self.gestures.clear_progress();
+                    if let Some(reset) = &mut self.reset {
+                        reset.fixation.clear();
+                    }
+                    return None;
                 }
                 let now = Instant::now();
                 let previous_quality = self.quality;
@@ -339,15 +474,27 @@ impl Runtime {
                     self.clear_tracking(Quality::Stale);
                 }
                 self.last_frame = Some(now);
+                let mut action = None;
                 match self.control_mode {
                     ControlMode::Eye => {
                         self.quality = quality;
-                        if let Some(features) = features.filter(|_| quality == Quality::Tracked) {
+                        let features = features.filter(|features| {
+                            quality == Quality::Tracked
+                                && features.iter().all(|value| value.is_finite())
+                        });
+                        if let Some(features) = features {
                             self.last_tracked = Some(now);
                             self.recent.push_back((now, features));
-                            self.update_point(features);
                         } else {
                             self.point = None;
+                        }
+                        action = if self.reset.is_some() {
+                            self.advance_reset(now, timestamp, features)
+                        } else {
+                            self.observe_gesture(timestamp, features, pose, bilateral_closed)
+                        };
+                        if let Some(features) = features {
+                            self.update_point(features);
                         }
                         while self
                             .recent
@@ -375,8 +522,128 @@ impl Runtime {
                 {
                     self.publish();
                 }
+                return action;
             }
         }
+        None
+    }
+
+    fn gesture_available(&self) -> bool {
+        self.camera == Camera::Running
+            && self.control_mode == ControlMode::Eye
+            && self.stream.is_some()
+            && !self.calibration_active()
+            && !self.exiting
+    }
+
+    fn observe_gesture(
+        &mut self,
+        timestamp: u64,
+        features: Option<Features>,
+        pose: Option<HeadPose>,
+        bilateral_closed: bool,
+    ) -> Option<MainAction> {
+        if !self.gesture_available() {
+            return None;
+        }
+        let pose = pose.filter(|pose| pose.iter().all(|angle| angle.abs() <= 0.55));
+        let eyes = match (pose, features) {
+            (Some(pose), Some(features)) => Eyes::Open {
+                gaze: self
+                    .mapping
+                    .as_ref()
+                    .filter(|(screen, _)| *screen == Screen::primary())
+                    .map(|(_, mapping)| mapping.eye_point(features)),
+                pose,
+            },
+            (Some(_), None) if self.quality == Quality::EyesClosed && bilateral_closed => {
+                Eyes::Closed
+            }
+            _ => Eyes::Unreliable,
+        };
+        match self.gestures.observe(timestamp, eyes)? {
+            Gesture::TogglePointer => {
+                if self.pointer_enabled {
+                    self.disarm();
+                    self.message = Some("已用顺时针眼动暂停指针。".into());
+                } else {
+                    self.message = match check_pointer_ready(self) {
+                        Err(message) => Some(message),
+                        Ok(()) if !macos::can_move_pointer() => {
+                            Some("请先用「启用指针」授予 macOS 辅助功能权限。".into())
+                        }
+                        Ok(()) => {
+                            self.arm();
+                            Some("已用顺时针眼动启用指针。".into())
+                        }
+                    };
+                }
+                self.publish();
+                None
+            }
+            Gesture::Exit => {
+                self.disarm();
+                Some(MainAction::Exit(self.activation_generation))
+            }
+            Gesture::ResetCenter => {
+                self.disarm();
+                self.reset_sequence = self.reset_sequence.wrapping_add(1);
+                self.reset = Some(ResetSession::new(
+                    self.reset_sequence,
+                    Screen::primary(),
+                    Instant::now(),
+                ));
+                self.message = None;
+                self.publish();
+                Some(MainAction::OpenReset(self.reset_sequence))
+            }
+        }
+    }
+
+    fn advance_reset(
+        &mut self,
+        now: Instant,
+        timestamp: u64,
+        features: Option<Features>,
+    ) -> Option<MainAction> {
+        let reset = self.reset.as_mut()?;
+        if self.stream.is_none() || reset.expires <= now {
+            return None;
+        }
+        if reset.screen != Screen::primary() {
+            self.message = Some("主显示器已改变，请重新校准。".into());
+            let action = self.cancel_reset();
+            self.publish();
+            return action;
+        }
+        if !reset.track(now, timestamp, features) {
+            return None;
+        }
+        if let Ok(samples) = <&[(Features, Point); 3]>::try_from(reset.samples.as_slice()) {
+            let screen = reset.screen;
+            let previous = self
+                .mapping
+                .as_ref()
+                .filter(|(previous_screen, _)| *previous_screen == screen)
+                .map(|(_, mapping)| mapping);
+            self.message = Some(
+                match Mapping::reset_center(previous, samples) {
+                    Ok(mapping) => {
+                        self.mapping = Some((screen, mapping));
+                        self.validation = None;
+                        self.point = None;
+                        "快速校准已完成。指针已暂停。"
+                    }
+                    Err(error) => error,
+                }
+                .into(),
+            );
+            let action = self.cancel_reset();
+            self.publish();
+            return action;
+        }
+        self.publish();
+        None
     }
 
     fn update_point(&mut self, features: Features) {
@@ -465,12 +732,101 @@ impl Runtime {
     }
 }
 
-#[tauri::command]
-fn subscribe(state: State<'_, Shared>, channel: Channel<Snapshot>) {
+fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
+    let Some(action) = action else { return };
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || match action {
+        MainAction::OpenReset(id) => open_reset(&handle, id),
+        MainAction::CloseReset(id) => {
+            let _ = close_reset(&handle, id);
+        }
+        MainAction::Exit(activation_generation) => {
+            {
+                let state = handle.state::<Shared>();
+                let mut runtime = lock(&state);
+                if runtime.activation_generation != activation_generation
+                    || !runtime.gesture_available()
+                    || !runtime.can_sample()
+                {
+                    return;
+                }
+                runtime.exiting = true;
+                // Reap the tracker before requesting exit, including Tauri's direct-exit fallback.
+                runtime.stop(None);
+            }
+            handle.exit(0);
+        }
+    });
+}
+
+fn open_reset(app: &AppHandle, id: u32) {
+    let state = app.state::<Shared>();
+    {
+        let runtime = lock(&state);
+        if runtime.stream.is_none() || !runtime.reset.as_ref().is_some_and(|reset| reset.id == id) {
+            return;
+        }
+    }
+    let window = app.get_webview_window("main");
+    let result = (|| -> Result<(), String> {
+        let window = window.as_ref().ok_or("无法打开快速校准窗口。")?;
+        app.show().map_err(|error| error.to_string())?;
+        window.show().map_err(|error| error.to_string())?;
+        window.unminimize().map_err(|error| error.to_string())?;
+        monitor(window)?;
+        window.set_focus().map_err(|error| error.to_string())?;
+        window
+            .set_simple_fullscreen(true)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
     let mut runtime = lock(&state);
-    runtime.clear_tracking(Quality::Searching);
-    runtime.stream = Some(channel);
-    runtime.publish();
+    let reset = runtime.reset.as_mut().filter(|reset| reset.id == id);
+    match (reset, result) {
+        (Some(reset), Ok(())) => {
+            reset.visible = true;
+            reset.expires = Instant::now() + RESET_TARGET_TIMEOUT;
+            runtime.reset_fullscreen = Some(id);
+            runtime.publish();
+        }
+        (Some(_), Err(error)) => {
+            runtime.cancel_reset();
+            runtime.message = Some(error);
+            runtime.publish();
+        }
+        (None, Ok(())) => {
+            drop(runtime);
+            let _ = window.unwrap().set_simple_fullscreen(false);
+        }
+        (None, Err(_)) => {}
+    }
+}
+
+fn close_reset(app: &AppHandle, id: u32) -> Result<(), String> {
+    let state = app.state::<Shared>();
+    if lock(&state).reset_fullscreen != Some(id) {
+        return Ok(());
+    }
+    let result = app
+        .get_webview_window("main")
+        .map(|window| window.set_simple_fullscreen(false))
+        .transpose()
+        .map_err(|error| error.to_string());
+    lock(&state).reset_fullscreen = None;
+    result.map(|_| ())
+}
+
+#[tauri::command]
+fn subscribe(app: AppHandle, state: State<'_, Shared>, channel: Channel<Snapshot>) {
+    let action = {
+        let mut runtime = lock(&state);
+        let action = runtime.cancel_reset();
+        runtime.clear_tracking(Quality::Searching);
+        runtime.stream = Some(channel);
+        runtime.publish();
+        action
+    };
+    dispatch_main_action(&app, action);
 }
 
 #[tauri::command]
@@ -483,7 +839,7 @@ fn set_control_mode(
     if runtime.control_mode == control_mode {
         return Ok(());
     }
-    if runtime.session.is_some() {
+    if runtime.calibration_active() {
         return Err("请先退出屏幕校准或验证。".into());
     }
     runtime.clear_tracking(Quality::Searching);
@@ -531,7 +887,7 @@ async fn start_camera(app: AppHandle, state: State<'_, Shared>) -> Result<(), St
     let mut command = tracker_command()?;
     let generation = {
         let mut runtime = lock(&state);
-        if matches!(runtime.camera, Camera::Starting | Camera::Running) {
+        if runtime.exiting || matches!(runtime.camera, Camera::Starting | Camera::Running) {
             return Ok(());
         }
         runtime.generation = runtime.generation.wrapping_add(1);
@@ -579,23 +935,31 @@ async fn start_camera(app: AppHandle, state: State<'_, Shared>) -> Result<(), St
             let Ok(packet) = serde_json::from_str::<Packet>(&line) else {
                 continue;
             };
+            let action = {
+                let mut runtime = lock(&state);
+                if runtime.generation != generation {
+                    return;
+                }
+                runtime.accept(packet)
+            };
+            dispatch_main_action(&app, action);
+        }
+        let action = {
             let mut runtime = lock(&state);
             if runtime.generation != generation {
                 return;
             }
-            runtime.accept(packet);
-        }
-        let mut runtime = lock(&state);
-        if runtime.generation == generation {
-            runtime.stop(Some("跟踪组件已退出。请检查相机权限后重试。".into()));
-        }
+            runtime.stop(Some("跟踪组件已退出。请检查相机权限后重试。".into()))
+        };
+        dispatch_main_action(&app, action);
     });
     Ok(())
 }
 
 #[tauri::command]
-fn stop_camera(state: State<'_, Shared>) {
-    lock(&state).stop(None);
+fn stop_camera(app: AppHandle, state: State<'_, Shared>) {
+    let action = lock(&state).stop(None);
+    dispatch_main_action(&app, action);
 }
 
 #[tauri::command]
@@ -622,16 +986,15 @@ fn enable_pointer(state: State<'_, Shared>) -> Result<(), String> {
         return Err("启用已取消。请再次选择「启用指针」。".into());
     }
     check_pointer_ready(&runtime)?;
-    runtime.pointer_enabled = true;
-    runtime.head_motion_at = Some(Instant::now());
-    runtime.message = None;
+    runtime.arm();
     runtime.publish();
     Ok(())
 }
 
 fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
-    if runtime.session.is_some()
+    if runtime.calibration_active()
         || runtime.head_capture.is_some()
+        || runtime.exiting
         || !runtime.calibrated()
         || !runtime.can_sample()
     {
@@ -664,6 +1027,7 @@ fn monitor(window: &WebviewWindow) -> Result<tauri::Monitor, String> {
 
 #[tauri::command]
 async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+    monitor(&window)?;
     let started = Instant::now();
     let screen = Screen::primary();
     {
@@ -674,7 +1038,6 @@ async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Res
         if runtime.head_capture.is_some() {
             return Err("正在采样。".into());
         }
-        monitor(&window)?;
         runtime.disarm();
         runtime.head_samples.clear();
         runtime.head_capture = Some(started);
@@ -719,10 +1082,11 @@ fn begin_exercise(
     state: State<'_, Shared>,
     mode: Exercise,
 ) -> Result<Step, String> {
+    monitor(&window)?;
     let mut runtime = lock(&state);
     if runtime.control_mode != ControlMode::Eye
         || !runtime.can_sample()
-        || runtime.session.is_some()
+        || runtime.calibration_active()
     {
         return Err("请让摄像头看到双眼，再开始。".into());
     }
@@ -736,11 +1100,7 @@ fn begin_exercise(
             return Err("请先完成当前显示器的校准。".into());
         }
     }
-    monitor(&window)?;
     runtime.disarm();
-    window
-        .set_simple_fullscreen(true)
-        .map_err(|error| error.to_string())?;
     let session = Session {
         mode,
         screen,
@@ -751,17 +1111,87 @@ fn begin_exercise(
     runtime.session = Some(session);
     runtime.message = None;
     runtime.publish();
+    drop(runtime);
+    if let Err(error) = window.set_simple_fullscreen(true) {
+        lock(&state).session = None;
+        return Err(error.to_string());
+    }
     Ok(step)
 }
 
 #[tauri::command]
-fn cancel_exercise(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+fn cancel_exercise(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+) -> Result<(), String> {
     let mut runtime = lock(&state);
-    runtime.session = None;
+    if runtime.reset.is_some() {
+        let action = runtime.cancel_reset();
+        runtime.message = Some("已取消快速校准。指针已暂停。".into());
+        runtime.publish();
+        drop(runtime);
+        if let Some(MainAction::CloseReset(id)) = action {
+            close_reset(&app, id)?;
+        }
+        return Ok(());
+    }
+    if runtime.session.take().is_none() {
+        return Ok(());
+    }
+    runtime.closing_exercise = true;
+    runtime.gestures.clear_progress();
     drop(runtime);
-    window
+    close_manual_exercise(&window, &state)
+}
+
+fn close_manual_exercise(window: &WebviewWindow, state: &Shared) -> Result<(), String> {
+    let result = window
         .set_simple_fullscreen(false)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+    lock(state).closing_exercise = false;
+    result
+}
+
+#[tauri::command]
+fn reset_target_ready(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+    id: u32,
+    index: usize,
+) -> Result<(), String> {
+    let pending = |reset: &ResetSession| {
+        reset.id == id
+            && reset.visible
+            && reset.samples.len() + 1 == index
+            && reset.target.is_none()
+    };
+    if !lock(&state).reset.as_ref().is_some_and(pending) {
+        return Ok(());
+    }
+    let point = RESET_POINTS[index - 1];
+    let target = (|| {
+        if !window.is_focused().map_err(|error| error.to_string())? {
+            return Err("快速校准窗口已失去焦点。".into());
+        }
+        screen_target(&window, point)
+    })();
+    let mut runtime = lock(&state);
+    let Some(reset) = runtime.reset.as_mut().filter(|reset| pending(reset)) else {
+        return Ok(());
+    };
+    match target {
+        Ok(target) => reset.target = Some((target, Instant::now())),
+        Err(error) => {
+            let action = runtime.cancel_reset();
+            runtime.message = Some(error);
+            runtime.publish();
+            drop(runtime);
+            dispatch_main_action(&app, action);
+        }
+    }
+    Ok(())
 }
 
 fn screen_target(window: &WebviewWindow, point: Point) -> Result<Point, String> {
@@ -867,11 +1297,10 @@ async fn capture_target(
             None
         }
     };
+    runtime.closing_exercise = true;
     runtime.publish();
     drop(runtime);
-    window
-        .set_simple_fullscreen(false)
-        .map_err(|error| error.to_string())?;
+    close_manual_exercise(&window, &state)?;
     Ok(CaptureResult {
         next: None,
         message,
@@ -905,7 +1334,8 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(220));
-                lock(&handle.state::<Shared>()).watchdog();
+                let action = lock(&handle.state::<Shared>()).watchdog();
+                dispatch_main_action(&handle, action);
             });
             Ok(())
         })
@@ -919,14 +1349,34 @@ pub fn run() {
             capture_neutral,
             begin_exercise,
             cancel_exercise,
-            capture_target
+            capture_target,
+            reset_target_ready
         ])
         .build(tauri::generate_context!())
         .expect("build Eyes Mouse")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app, event| match event {
+            tauri::RunEvent::Exit => {
                 lock(&app.state::<Shared>()).stop(None);
             }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Focused(false),
+                ..
+            } if label == "main" => {
+                let action = {
+                    let state = app.state::<Shared>();
+                    let mut runtime = lock(&state);
+                    if !runtime.reset.as_ref().is_some_and(|reset| reset.visible) {
+                        return;
+                    }
+                    runtime.message = Some("快速校准窗口已失去焦点。".into());
+                    let action = runtime.cancel_reset();
+                    runtime.publish();
+                    action
+                };
+                dispatch_main_action(app, action);
+            }
+            _ => {}
         });
 }
 
@@ -956,6 +1406,7 @@ mod tests {
             quality: Quality::EyesClosed,
             features: None,
             pose,
+            bilateral_closed: true,
         };
         let mut runtime = Runtime {
             camera: Camera::Running,
@@ -1021,5 +1472,50 @@ mod tests {
         assert!(runtime.quality == Quality::Stale);
         assert!(runtime.point.is_none());
         assert!(!runtime.pointer_enabled);
+    }
+
+    #[test]
+    fn rejected_reset_times_out_without_replacing_the_mapping_or_resuming_the_pointer() {
+        let now = Instant::now();
+        let screen = Screen::primary();
+        let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
+        let mapping =
+            Mapping::fit(&CALIBRATION_POINTS.map(|point| (features(point), point))).unwrap();
+        let previous_point = mapping.predict(features([0.40, 0.60]));
+        let mut reset = ResetSession::new(1, screen, now);
+        reset.visible = true;
+        reset
+            .samples
+            .push((features(RESET_POINTS[0]), RESET_POINTS[0]));
+        reset.target = Some((RESET_POINTS[1], now));
+        let mut runtime = Runtime {
+            camera: Camera::Running,
+            mapping: Some((screen, mapping)),
+            stream: Some(Channel::new(|_| Ok(()))),
+            reset: Some(reset),
+            reset_fullscreen: Some(1),
+            ..Runtime::default()
+        };
+        let mut corner = features(RESET_POINTS[1]);
+        corner[2] = 0.40;
+        for timestamp in (500..=2_000).step_by(45) {
+            let time = now + Duration::from_millis(timestamp);
+            assert!(runtime
+                .advance_reset(time, timestamp, Some(corner))
+                .is_none());
+        }
+        let reset = runtime.reset.as_mut().unwrap();
+        assert_eq!(reset.samples.len(), 1);
+        reset.expires = now;
+        assert!(matches!(
+            runtime.watchdog(),
+            Some(MainAction::CloseReset(1))
+        ));
+        assert!(runtime.reset.is_none());
+        assert!(!runtime.pointer_enabled);
+        assert_eq!(
+            runtime.mapping.unwrap().1.predict(features([0.40, 0.60])),
+            previous_point
+        );
     }
 }

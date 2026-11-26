@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Channel, invoke } from '@tauri-apps/api/core'
 
 type Point = [number, number]
@@ -18,12 +18,17 @@ interface Snapshot {
   point: Point | null
   validation: { medianPoints: number; p90Points: number } | null
   message: string | null
+  resetExercise: ResetStep | null
 }
 
 interface Step {
   point: Point
   index: number
   total: number
+}
+
+interface ResetStep extends Step {
+  id: number
 }
 
 const state = ref<Snapshot>({
@@ -36,6 +41,7 @@ const state = ref<Snapshot>({
   point: null,
   validation: null,
   message: null,
+  resetExercise: null,
 })
 const connected = ref(false)
 const pending = ref(false)
@@ -47,9 +53,13 @@ const mode = ref<Mode>('calibrate')
 const exercise = ref<HTMLElement | null>(null)
 let exerciseSequence = 0
 let activateAfterClose = ""
+let resetFocus = ""
 
 const tracked = computed(() => state.value.camera === 'running' && state.value.quality === 'tracked')
 const headControl = computed(() => state.value.controlMode === 'head')
+const resetStep = computed(() => state.value.resetExercise)
+const activeStep = computed(() => resetStep.value ?? step.value)
+const resetLocation = computed(() => ['中央', '左上', '右下'][(resetStep.value?.index ?? 1) - 1])
 const isStarting = computed(() => state.value.camera === 'starting')
 const cameraActive = computed(() => state.value.camera === 'running' || isStarting.value)
 const notice = computed(() => message.value || state.value.message)
@@ -161,7 +171,8 @@ async function capture() {
 }
 
 async function cancel() {
-  if (!step.value || pending.value) return
+  if (!activeStep.value || pending.value) return
+  const resetting = Boolean(resetStep.value)
   exerciseSequence += 1
   sampling.value = false
   pending.value = true
@@ -169,7 +180,7 @@ async function cancel() {
     await invoke('cancel_exercise')
     pending.value = false
     message.value = ''
-    await leaveExercise()
+    if (!resetting) await leaveExercise()
   } catch (error) {
     message.value = errorText(error)
   } finally {
@@ -178,15 +189,40 @@ async function cancel() {
 }
 
 function onKeydown(event: KeyboardEvent) {
-  if (!step.value || event.repeat) return
+  if (!activeStep.value || event.repeat) return
   if (event.code === 'Escape') {
     event.preventDefault()
     void cancel()
-  } else if (event.code === 'Space' && !(event.target instanceof HTMLButtonElement)) {
+  } else if (step.value && event.code === 'Space' && !(event.target instanceof HTMLButtonElement)) {
     event.preventDefault()
     void capture()
   }
 }
+
+watch(() => resetStep.value && `${resetStep.value.id}:${resetStep.value.index}`, async (key, previous) => {
+  if (!key) {
+    await nextTick()
+    if (!resetStep.value) document.getElementById(resetFocus)?.focus()
+    resetFocus = ''
+    return
+  }
+  const reset = resetStep.value
+  if (!reset) return
+  if (reset.id !== Number(previous?.split(':')[0])) {
+    resetFocus = document.activeElement?.id || 'calibrate'
+    message.value = ''
+    await nextTick()
+    exercise.value?.focus()
+  }
+  // Acknowledge the target after the browser has painted the new position.
+  await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+  if (resetStep.value?.id !== reset.id || resetStep.value.index !== reset.index) return
+  try {
+    await invoke('reset_target_ready', { id: reset.id, index: reset.index })
+  } catch (error) {
+    message.value = errorText(error)
+  }
+})
 
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
@@ -202,15 +238,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
 
 <template>
-  <div v-if="step" ref="exercise" class="exercise" tabindex="-1" aria-label="全屏注视目标">
+  <div v-if="activeStep" ref="exercise" class="exercise" tabindex="-1" aria-label="全屏注视目标">
     <div class="exercise-bar">
-      <span>{{ mode === 'calibrate' ? '九点校准' : '五点精度验证' }} <strong>{{ step.index }} / {{ step.total }}</strong></span>
+      <span>{{ resetStep ? '快速校准' : mode === 'calibrate' ? '九点校准' : '五点精度验证' }} <strong>{{ activeStep.index }} / {{ activeStep.total }}</strong></span>
       <button type="button" class="exercise-exit" @click="cancel">退出 <kbd>Esc</kbd></button>
     </div>
-    <span class="exercise-dot" :class="{ sampling }" :style="coordinates(step.point)" aria-hidden="true"></span>
+    <span class="exercise-dot" :class="{ sampling }" :style="coordinates(activeStep.point)" aria-hidden="true"></span>
     <div class="exercise-instruction" aria-live="polite">
       <strong v-if="sampling">正在采样，请保持注视</strong>
       <strong v-else-if="!tracked">请让相机看到双眼</strong>
+      <strong v-else-if="resetStep">注视{{ resetLocation }}的亮点，保持头部稳定</strong>
       <strong v-else>看向亮点，按空格采样</strong>
       <p v-if="notice">{{ notice }}</p>
     </div>
@@ -309,6 +346,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <div>
               <h2>系统指针</h2>
               <p>用鼠标或触控板点击。随时按 <kbd>⌃</kbd><kbd>⌥</kbd><kbd>P</kbd> 暂停。</p>
+              <template v-if="!headControl">
+                <p>校准后用视线画一圈。顺时针启用或暂停指针，逆时针退出应用。</p>
+                <p>快速眨眼三次，依次注视中央、左上和右下的亮点。</p>
+              </template>
             </div>
             <button v-if="state.pointerEnabled" type="button" class="button accent" :disabled="pending" @click="action('pause_pointer')">暂停指针</button>
             <button v-else type="button" class="button" :class="{ accent: state.calibrated && tracked }" :disabled="!state.calibrated || !tracked || !state.pauseAvailable || pending" @click="action('enable_pointer')">启用指针</button>
