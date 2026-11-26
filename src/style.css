@@ -158,6 +158,8 @@ h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.03em; line-height: 1.
 .button.quiet:not(:hover) { border-color: transparent; }
 .button:disabled { color: oklch(0.52 0.012 32); background: oklch(0.97 0.003 32); cursor: default; }
 .control-select { font-family: inherit; max-width: 100%; }
+.display-control { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+.display-control .control-select { text-overflow: ellipsis; }
 .damping-control { gap: 4px; }
 .damping-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
 .damping-heading .numbers { color: var(--muted); font-size: 13px; }

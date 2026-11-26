@@ -3,7 +3,7 @@ use crate::calibration::{
     RESET_POINTS, VALIDATION_POINTS,
 };
 use crate::gestures::{Detector, Eyes, Gesture};
-use crate::macos::{self, Screen};
+use crate::macos::{self, Display, Motion, MotionResult, Screen, WindowFrame};
 use crate::snake;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -30,6 +30,7 @@ const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const RESET_SETTLE: Duration = Duration::from_millis(500);
 const EYE_DAMPING_FILE: &str = "eye-damping.json";
 const CONTROL_MODE_FILE: &str = "control-mode.json";
+const DISPLAY_RECONFIGURING: &str = "显示器设置正在更改，请稍后重试。";
 
 type HeadPose = [f64; 2];
 
@@ -183,6 +184,9 @@ struct Snapshot {
     quality: Quality,
     control_mode: ControlMode,
     eye_damping: EyeDamping,
+    displays: Vec<Display>,
+    selected_display_id: Option<u32>,
+    display_revision: u32,
     calibrated: bool,
     pointer_enabled: bool,
     pointer_access: PointerAccess,
@@ -293,7 +297,7 @@ impl ResetSession {
 
 enum MainAction {
     OpenReset(u32),
-    CloseReset(u32),
+    CloseExercise,
     Exit(u64),
     RestartForPointerAccess,
 }
@@ -320,6 +324,10 @@ struct Runtime {
     quality: Quality,
     control_mode: ControlMode,
     eye_damping: EyeDamping,
+    displays: Vec<Display>,
+    preferred_display_id: Option<u32>,
+    selected_screen: Option<Screen>,
+    display_revision: u32,
     child: Option<Child>,
     generation: u64,
     camera_started: Option<Instant>,
@@ -333,11 +341,11 @@ struct Runtime {
     head_motion_at: Option<Instant>,
     stream: Option<Channel<Snapshot>>,
     session: Option<Session>,
+    exercise_frame: Option<WindowFrame>,
     closing_exercise: bool,
     gestures: Detector,
     reset_sequence: u32,
     reset: Option<ResetSession>,
-    reset_fullscreen: Option<u32>,
     exiting: bool,
     mapping: Option<(Screen, Mapping)>,
     validation: Option<Validation>,
@@ -366,6 +374,9 @@ impl Runtime {
             quality: self.quality,
             control_mode: self.control_mode,
             eye_damping: self.eye_damping,
+            displays: self.displays.clone(),
+            selected_display_id: self.selected_screen.map(|screen| screen.id),
+            display_revision: self.display_revision,
             calibrated: self.calibrated(),
             pointer_enabled: self.pointer_enabled,
             pointer_access: self.pointer_access,
@@ -395,6 +406,62 @@ impl Runtime {
             ControlMode::Eye => self.mapping.is_some(),
             ControlMode::Head => self.neutral.is_some(),
         }
+    }
+
+    fn update_displays(&mut self, displays: Vec<Display>) -> Option<MainAction> {
+        let target = displays
+            .iter()
+            .find(|display| match self.preferred_display_id {
+                Some(id) => display.screen.id == id,
+                None => display.primary,
+            })
+            .map(|display| display.screen);
+        let changed = self.displays != displays;
+        self.displays = displays;
+        if self.selected_screen != target {
+            self.update_selected_screen(target)
+        } else {
+            if changed {
+                self.publish();
+            }
+            None
+        }
+    }
+
+    fn update_selected_screen(&mut self, target: Option<Screen>) -> Option<MainAction> {
+        let initialized = self.display_revision != 0;
+        self.selected_screen = target;
+        self.display_revision = self.display_revision.wrapping_add(1);
+        self.disarm();
+        self.mapping = None;
+        self.validation = None;
+        self.neutral = None;
+        self.point = None;
+        self.head_samples.clear();
+        self.head_capture = None;
+        self.recent.clear();
+        let action = self.cancel_exercises();
+        if initialized {
+            self.message = Some(
+                match (target, self.control_mode) {
+                    (Some(_), ControlMode::Eye) => "目标显示器已更改。指针已暂停，请重新校准。",
+                    (Some(_), ControlMode::Head) => {
+                        "目标显示器已更改。指针已暂停，请重新设定正面位置。"
+                    }
+                    (None, _) => {
+                        "目标显示器已断开或暂不可用。指针已暂停，请重新连接或选择其他显示器。"
+                    }
+                }
+                .into(),
+            );
+        }
+        self.publish();
+        action
+    }
+
+    fn selected_screen_is_current(&self) -> bool {
+        self.selected_screen
+            .is_some_and(|screen| screen.is_current(self.preferred_display_id.is_none()))
     }
 
     fn request_pointer_access(
@@ -490,13 +557,28 @@ impl Runtime {
         self.session.is_some()
             || self.closing_exercise
             || self.reset.is_some()
-            || self.reset_fullscreen.is_some()
+            || self.exercise_frame.is_some()
     }
 
     fn cancel_reset(&mut self) -> Option<MainAction> {
         self.reset.take()?;
+        self.end_exercise()
+    }
+
+    fn cancel_exercises(&mut self) -> Option<MainAction> {
+        self.session = None;
+        self.reset = None;
+        self.end_exercise()
+    }
+
+    fn end_exercise(&mut self) -> Option<MainAction> {
         self.gestures.clear_progress();
-        self.reset_fullscreen.map(MainAction::CloseReset)
+        if self.exercise_frame.is_some() && !self.closing_exercise {
+            self.closing_exercise = true;
+            Some(MainAction::CloseExercise)
+        } else {
+            None
+        }
     }
 
     fn stop(&mut self, message: Option<String>) -> Option<MainAction> {
@@ -614,6 +696,19 @@ impl Runtime {
                     }
                     return None;
                 }
+                if self.calibration_active() || self.head_capture.is_some() {
+                    if macos::display_reconfiguring() {
+                        self.recent.clear();
+                        self.head_samples.clear();
+                        if let Some(reset) = &mut self.reset {
+                            reset.fixation.clear();
+                        }
+                        return None;
+                    }
+                    if self.selected_screen.is_some() && !self.selected_screen_is_current() {
+                        return self.update_selected_screen(None);
+                    }
+                }
                 let now = Instant::now();
                 let previous_quality = self.quality;
                 let was_enabled = self.pointer_enabled;
@@ -648,7 +743,7 @@ impl Runtime {
                             self.observe_gesture(timestamp, features, pose, bilateral_closed)
                         };
                         if let Some(features) = features {
-                            self.update_point(features);
+                            self.update_point(features, was_enabled);
                         }
                         while self
                             .recent
@@ -707,7 +802,7 @@ impl Runtime {
                 gaze: self
                     .mapping
                     .as_ref()
-                    .filter(|(screen, _)| *screen == Screen::primary())
+                    .filter(|(screen, _)| Some(*screen) == self.selected_screen)
                     .map(|(_, mapping)| mapping.eye_point(features)),
                 pose,
             },
@@ -728,11 +823,10 @@ impl Runtime {
                             self.pointer_access = PointerAccess::without_post_access();
                             Some("指针未启用，请查看「辅助功能权限」状态。".into())
                         }
-                        Ok(()) => {
-                            self.pointer_access = PointerAccess::Granted;
-                            self.arm();
-                            Some("已用左右眼动手势启用指针。".into())
-                        }
+                        Ok(()) => Some(match self.activate_pointer() {
+                            Ok(()) => "已用左右眼动手势启用指针。".into(),
+                            Err(error) => error,
+                        }),
                     };
                 }
                 self.publish();
@@ -743,11 +837,16 @@ impl Runtime {
                 Some(MainAction::Exit(self.activation_generation))
             }
             Gesture::ResetCenter => {
+                let Some(screen) = self.selected_screen else {
+                    self.message = Some("请选择可用的目标显示器，再快速校准。".into());
+                    self.publish();
+                    return None;
+                };
                 self.disarm();
                 self.reset_sequence = self.reset_sequence.wrapping_add(1);
                 self.reset = Some(ResetSession::new(
                     self.reset_sequence,
-                    Screen::primary(),
+                    screen,
                     Instant::now(),
                 ));
                 self.message = None;
@@ -766,12 +865,6 @@ impl Runtime {
         let reset = self.reset.as_mut()?;
         if self.stream.is_none() || reset.expires <= now {
             return None;
-        }
-        if reset.screen != Screen::primary() {
-            self.message = Some("主显示器已改变，请重新校准。".into());
-            let action = self.cancel_reset();
-            self.publish();
-            return action;
         }
         if !reset.track(now, timestamp, features) {
             return None;
@@ -803,18 +896,11 @@ impl Runtime {
         None
     }
 
-    fn update_point(&mut self, features: Features) {
+    fn update_point(&mut self, features: Features, was_enabled: bool) {
         let Some((screen, mapping)) = &self.mapping else {
             return;
         };
-        if *screen != Screen::primary() {
-            self.mapping = None;
-            self.validation = None;
-            self.disarm();
-            self.point = None;
-            self.message = Some("主显示器已改变，请重新校准。".into());
-            return;
-        }
+        let screen = *screen;
         let mut point = mapping
             .predict(features)
             .map(|position| position.clamp(0.0, 1.0));
@@ -826,10 +912,8 @@ impl Runtime {
             }
         }
         self.point = Some(point);
-        if self.pointer_enabled
-            && (!macos::can_move_pointer() || screen.move_pointer(point).is_err())
-        {
-            self.pointer_access_error();
+        if self.pointer_enabled && was_enabled {
+            self.move_pointer(screen, Motion::Eye(point));
         }
     }
 
@@ -851,36 +935,56 @@ impl Runtime {
         let Some((screen, neutral)) = self.neutral else {
             return;
         };
-        if screen != Screen::primary() {
-            self.neutral = None;
-            self.disarm();
-            self.point = None;
-            self.message = Some("主显示器已改变，请重新设定正面位置。".into());
-            return;
-        }
         let velocity = head_velocity(pose, neutral);
         self.point = Some(velocity.map(|component| 0.5 + 0.44 * component));
         if !self.pointer_enabled {
             return;
         }
         let elapsed = now - self.head_motion_at.replace(now).unwrap_or(now);
-        if velocity == [0.0; 2] {
-            return;
-        }
         let distance = HEAD_MAX_SPEED * elapsed.min(HEAD_MAX_FRAME_TIME).as_secs_f64();
         let offset = velocity.map(|component| component * distance);
+        self.move_pointer(screen, Motion::Head(offset));
+    }
+
+    fn activate_pointer(&mut self) -> Result<(), String> {
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING.into());
+        }
+        let screen = self.selected_screen.ok_or("请选择可用的目标显示器。")?;
+        if self.move_pointer(screen, Motion::Activate) {
+            self.pointer_access = PointerAccess::Granted;
+            self.arm();
+            Ok(())
+        } else {
+            Err(self
+                .message
+                .clone()
+                .unwrap_or_else(|| "无法启用指针。".into()))
+        }
+    }
+
+    fn move_pointer(&mut self, screen: Screen, motion: Motion) -> bool {
         if !macos::can_move_pointer() {
             self.pointer_access_error();
-            return;
+            return false;
         }
-        match screen.move_pointer_by(offset) {
-            Ok(true) => {}
-            Ok(false) => {
+        match screen.move_pointer(motion, self.preferred_display_id.is_none()) {
+            Ok(MotionResult::Inside) => return true,
+            Ok(MotionResult::Outside) => {
                 self.disarm();
-                self.message = Some("指针已移出主显示器。请移回主显示器，再启用指针。".into());
+                self.message = Some("指针已移出目标显示器，控制已暂停。".into());
+            }
+            Ok(MotionResult::DisplayChanged) => {
+                self.update_selected_screen(None);
+            }
+            Ok(MotionResult::Reconfiguring) => {
+                if matches!(motion, Motion::Activate) {
+                    self.message = Some(DISPLAY_RECONFIGURING.into());
+                }
             }
             Err(()) => self.pointer_access_error(),
         }
+        false
     }
 
     fn pointer_access_error(&mut self) {
@@ -895,8 +999,8 @@ fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || match action {
         MainAction::OpenReset(id) => open_reset(&handle, id),
-        MainAction::CloseReset(id) => {
-            let _ = close_reset(&handle, id);
+        MainAction::CloseExercise => {
+            let _ = close_exercise(&handle);
         }
         MainAction::Exit(activation_generation) => {
             {
@@ -937,35 +1041,60 @@ fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
     });
 }
 
+async fn on_main<T: Send + 'static>(
+    app: &AppHandle,
+    task: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (complete, result) = oneshot::channel();
+    app.run_on_main_thread(move || {
+        let _ = complete.send(task());
+    })
+    .map_err(|error| error.to_string())?;
+    result.await.map_err(|error| error.to_string())?
+}
+
+fn refresh_displays(app: &AppHandle) {
+    if macos::display_reconfiguring() {
+        return;
+    }
+    let displays = macos::displays();
+    let action = lock(&app.state::<Shared>()).update_displays(displays);
+    dispatch_main_action(app, action);
+}
+
 fn open_reset(app: &AppHandle, id: u32) {
+    refresh_displays(app);
     let state = app.state::<Shared>();
-    {
+    let screen = {
         let runtime = lock(&state);
-        if runtime.stream.is_none() || !runtime.reset.as_ref().is_some_and(|reset| reset.id == id) {
+        let Some(reset) = runtime.reset.as_ref().filter(|reset| reset.id == id) else {
+            return;
+        };
+        if runtime.stream.is_none() {
             return;
         }
-    }
+        reset.screen
+    };
     let window = app.get_webview_window("main");
-    let result = (|| -> Result<(), String> {
+    let result = (|| {
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING.into());
+        }
         let window = window.as_ref().ok_or("无法打开快速校准窗口。")?;
         app.show().map_err(|error| error.to_string())?;
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
-        monitor(window)?;
         destroy_snake(app)?;
         window.set_focus().map_err(|error| error.to_string())?;
-        window
-            .set_simple_fullscreen(true)
-            .map_err(|error| error.to_string())?;
-        Ok(())
+        macos::open_exercise(window, screen)
     })();
     let mut runtime = lock(&state);
     let reset = runtime.reset.as_mut().filter(|reset| reset.id == id);
     match (reset, result) {
-        (Some(reset), Ok(())) => {
+        (Some(reset), Ok(frame)) => {
             reset.visible = true;
             reset.expires = Instant::now() + RESET_TARGET_TIMEOUT;
-            runtime.reset_fullscreen = Some(id);
+            runtime.exercise_frame = Some(frame);
             runtime.publish();
         }
         (Some(_), Err(error)) => {
@@ -973,25 +1102,25 @@ fn open_reset(app: &AppHandle, id: u32) {
             runtime.message = Some(error);
             runtime.publish();
         }
-        (None, Ok(())) => {
+        (None, Ok(frame)) => {
             drop(runtime);
-            let _ = window.unwrap().set_simple_fullscreen(false);
+            let _ = macos::close_exercise(window.as_ref().unwrap(), frame);
         }
         (None, Err(_)) => {}
     }
 }
 
-fn close_reset(app: &AppHandle, id: u32) -> Result<(), String> {
+fn close_exercise(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<Shared>();
-    if lock(&state).reset_fullscreen != Some(id) {
+    let frame = lock(&state).exercise_frame.take();
+    let Some(frame) = frame else {
         return Ok(());
-    }
+    };
     let result = app
         .get_webview_window("main")
-        .map(|window| window.set_simple_fullscreen(false))
-        .transpose()
-        .map_err(|error| error.to_string());
-    lock(&state).reset_fullscreen = None;
+        .map(|window| macos::close_exercise(&window, frame))
+        .transpose();
+    lock(&state).closing_exercise = false;
     result.map(|_| ())
 }
 
@@ -1042,6 +1171,38 @@ fn set_control_mode(
     }
     runtime.publish();
     result
+}
+
+#[tauri::command]
+async fn set_target_display(window: WebviewWindow, display_id: u32) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    let app = window.app_handle().clone();
+    let handle = app.clone();
+    on_main(&app, move || {
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING.into());
+        }
+        let displays = macos::displays();
+        let available = displays
+            .iter()
+            .any(|display| display.screen.id == display_id);
+        let action = {
+            let state = handle.state::<Shared>();
+            let mut runtime = lock(&state);
+            if available {
+                runtime.preferred_display_id = Some(display_id);
+            }
+            runtime.update_displays(displays)
+        };
+        if matches!(action, Some(MainAction::CloseExercise)) {
+            close_exercise(&handle)?;
+        }
+        if !available {
+            return Err("该显示器暂不可用，请重新选择。".into());
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1213,15 +1374,20 @@ fn enable_pointer(window: WebviewWindow, state: State<'_, Shared>) -> Result<(),
             macos::prompt_accessibility,
         );
     }
-    runtime.pointer_access = PointerAccess::Granted;
-    runtime.arm();
+    let result = runtime.activate_pointer();
     runtime.publish();
-    Ok(())
+    result
 }
 
 fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
     if runtime.pointer_access.in_progress() {
         return Err("请先完成辅助功能授权或取消等待。".into());
+    }
+    if macos::display_reconfiguring() {
+        return Err(DISPLAY_RECONFIGURING.into());
+    }
+    if !runtime.selected_screen_is_current() {
+        return Err("请选择可用的目标显示器。".into());
     }
     if runtime.calibration_active()
         || runtime.head_capture.is_some()
@@ -1239,21 +1405,6 @@ fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
         return Err("无法注册暂停快捷键 ⌃⌥P。请释放该组合键后重启应用。".into());
     }
     Ok(())
-}
-
-fn monitor(window: &WebviewWindow) -> Result<tauri::Monitor, String> {
-    let primary = window
-        .primary_monitor()
-        .map_err(|error| error.to_string())?
-        .ok_or("无法读取主显示器。")?;
-    let current = window
-        .current_monitor()
-        .map_err(|error| error.to_string())?
-        .ok_or("无法读取窗口所在显示器。")?;
-    if primary.position() != current.position() || primary.size() != current.size() {
-        return Err("请把 Eyes Mouse 窗口移到主显示器再继续。".into());
-    }
-    Ok(primary)
 }
 
 #[tauri::command]
@@ -1372,14 +1523,20 @@ fn snake_pointer(
 
 #[tauri::command]
 async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
-    monitor(&window)?;
+    require_pointer_controls(&window)?;
     let started = Instant::now();
-    let screen = Screen::primary();
-    {
+    let (screen, display_revision) = {
         let mut runtime = lock(&state);
         if runtime.control_mode != ControlMode::Head || !runtime.can_sample() {
             return Err("请选择头动，并让摄像头看到脸部。".into());
         }
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING.into());
+        }
+        let screen = runtime
+            .selected_screen
+            .filter(|_| runtime.selected_screen_is_current())
+            .ok_or("请选择可用的目标显示器。")?;
         if runtime.head_capture.is_some() {
             return Err("正在采样。".into());
         }
@@ -1389,11 +1546,19 @@ async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Res
         runtime.point = None;
         runtime.message = None;
         runtime.publish();
-    }
+        (screen, runtime.display_revision)
+    };
 
     let mut runtime = loop {
         tokio::time::sleep(Duration::from_millis(40)).await;
         let runtime = lock(&state);
+        if runtime.display_revision != display_revision {
+            return Err(match runtime.selected_screen {
+                Some(_) => "目标显示器已改变，请重新设定正面位置。",
+                None => "目标显示器已断开或暂不可用，请选择可用的显示器，再设定正面位置。",
+            }
+            .into());
+        }
         if runtime.head_capture != Some(started) {
             return Err("正面位置采样已取消。请让摄像头看到脸部后重试。".into());
         }
@@ -1405,8 +1570,12 @@ async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Res
     };
     runtime.head_capture = None;
     let poses = std::mem::take(&mut runtime.head_samples);
-    if screen != Screen::primary() {
-        return Err("主显示器已改变，请重新设定正面位置。".into());
+    if macos::display_reconfiguring() {
+        return Err(DISPLAY_RECONFIGURING.into());
+    }
+    if !runtime.selected_screen_is_current() {
+        runtime.update_selected_screen(None);
+        return Err("目标显示器已改变，请重新设定正面位置。".into());
     }
     if poses.len() < HEAD_CAPTURE_SAMPLES || !runtime.can_sample() {
         return Err("有效采样不足。请面向屏幕、保持头部稳定后重试。".into());
@@ -1422,12 +1591,19 @@ async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Res
 }
 
 #[tauri::command]
-fn begin_exercise(
-    window: WebviewWindow,
-    state: State<'_, Shared>,
-    mode: Exercise,
-) -> Result<Step, String> {
-    monitor(&window)?;
+async fn begin_exercise(window: WebviewWindow, mode: Exercise) -> Result<Step, String> {
+    require_pointer_controls(&window)?;
+    let app = window.app_handle().clone();
+    on_main(&app, move || begin_exercise_on_main(&window, mode)).await
+}
+
+fn begin_exercise_on_main(window: &WebviewWindow, mode: Exercise) -> Result<Step, String> {
+    if macos::display_reconfiguring() {
+        return Err(DISPLAY_RECONFIGURING.into());
+    }
+    let app = window.app_handle();
+    refresh_displays(app);
+    let state = app.state::<Shared>();
     let mut runtime = lock(&state);
     if runtime.control_mode != ControlMode::Eye
         || !runtime.can_sample()
@@ -1435,7 +1611,10 @@ fn begin_exercise(
     {
         return Err("请让摄像头看到双眼，再开始。".into());
     }
-    let screen = Screen::primary();
+    let screen = runtime
+        .selected_screen
+        .filter(|_| runtime.selected_screen_is_current())
+        .ok_or("请选择可用的目标显示器。")?;
     if let Exercise::Verify = mode {
         if !runtime
             .mapping
@@ -1457,75 +1636,83 @@ fn begin_exercise(
     runtime.message = None;
     runtime.publish();
     drop(runtime);
-    let fullscreen = destroy_snake(window.app_handle()).and_then(|()| {
-        window
-            .set_simple_fullscreen(true)
-            .map_err(|error| error.to_string())
-    });
-    if let Err(error) = fullscreen {
-        lock(&state).session = None;
-        return Err(error);
-    }
-    Ok(step)
-}
-
-#[tauri::command]
-fn cancel_exercise(
-    app: AppHandle,
-    window: WebviewWindow,
-    state: State<'_, Shared>,
-) -> Result<(), String> {
+    let fullscreen = destroy_snake(app).and_then(|()| macos::open_exercise(window, screen));
     let mut runtime = lock(&state);
-    if runtime.reset.is_some() {
-        let action = runtime.cancel_reset();
-        runtime.message = Some("已取消快速校准。指针已暂停。".into());
-        runtime.publish();
-        drop(runtime);
-        if let Some(MainAction::CloseReset(id)) = action {
-            close_reset(&app, id)?;
+    match fullscreen {
+        Ok(frame) if runtime.session.is_some() => {
+            runtime.exercise_frame = Some(frame);
+            Ok(step)
         }
-        return Ok(());
+        Ok(frame) => {
+            drop(runtime);
+            let _ = macos::close_exercise(window, frame);
+            Err("校准已取消，请重新开始。".into())
+        }
+        Err(error) => {
+            runtime.session = None;
+            Err(error)
+        }
     }
-    if runtime.session.take().is_none() {
-        return Ok(());
-    }
-    runtime.closing_exercise = true;
-    runtime.gestures.clear_progress();
-    drop(runtime);
-    close_manual_exercise(&window, &state)
-}
-
-fn close_manual_exercise(window: &WebviewWindow, state: &Shared) -> Result<(), String> {
-    let result = window
-        .set_simple_fullscreen(false)
-        .map_err(|error| error.to_string());
-    lock(state).closing_exercise = false;
-    result
 }
 
 #[tauri::command]
-fn reset_target_ready(
-    app: AppHandle,
-    window: WebviewWindow,
-    state: State<'_, Shared>,
-    id: u32,
-    index: usize,
-) -> Result<(), String> {
+async fn cancel_exercise(window: WebviewWindow) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    let app = window.app_handle().clone();
+    let handle = app.clone();
+    on_main(&app, move || {
+        let state = handle.state::<Shared>();
+        let action = {
+            let mut runtime = lock(&state);
+            let resetting = runtime.reset.is_some();
+            let action = runtime.cancel_exercises();
+            if resetting {
+                runtime.message = Some("已取消快速校准。指针已暂停。".into());
+                runtime.publish();
+            }
+            action
+        };
+        if matches!(action, Some(MainAction::CloseExercise)) {
+            close_exercise(&handle)?;
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reset_target_ready(window: WebviewWindow, id: u32, index: usize) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    let app = window.app_handle().clone();
+    on_main(&app, move || reset_target_ready_on_main(&window, id, index)).await
+}
+
+fn reset_target_ready_on_main(window: &WebviewWindow, id: u32, index: usize) -> Result<(), String> {
+    let app = window.app_handle();
+    let state = app.state::<Shared>();
     let pending = |reset: &ResetSession| {
         reset.id == id
             && reset.visible
             && reset.samples.len() + 1 == index
             && reset.target.is_none()
     };
-    if !lock(&state).reset.as_ref().is_some_and(pending) {
+    let Some(screen) = lock(&state)
+        .reset
+        .as_ref()
+        .filter(|reset| pending(reset))
+        .map(|reset| reset.screen)
+    else {
         return Ok(());
-    }
+    };
     let point = RESET_POINTS[index - 1];
     let target = (|| {
+        if macos::display_reconfiguring() {
+            return Err(DISPLAY_RECONFIGURING.into());
+        }
         if !window.is_focused().map_err(|error| error.to_string())? {
             return Err("快速校准窗口已失去焦点。".into());
         }
-        screen_target(&window, point)
+        macos::exercise_target(window, screen, point)
     })();
     let mut runtime = lock(&state);
     let Some(reset) = runtime.reset.as_mut().filter(|reset| pending(reset)) else {
@@ -1538,23 +1725,10 @@ fn reset_target_ready(
             runtime.message = Some(error);
             runtime.publish();
             drop(runtime);
-            dispatch_main_action(&app, action);
+            dispatch_main_action(app, action);
         }
     }
     Ok(())
-}
-
-fn screen_target(window: &WebviewWindow, point: Point) -> Result<Point, String> {
-    let monitor = monitor(window)?;
-    let origin = window.inner_position().map_err(|error| error.to_string())?;
-    let size = window.inner_size().map_err(|error| error.to_string())?;
-    let expected = monitor.size();
-    Ok([
-        (f64::from(origin.x - monitor.position().x) + point[0] * f64::from(size.width))
-            / f64::from(expected.width),
-        (f64::from(origin.y - monitor.position().y) + point[1] * f64::from(size.height))
-            / f64::from(expected.height),
-    ])
 }
 
 #[tauri::command]
@@ -1562,6 +1736,7 @@ async fn capture_target(
     window: WebviewWindow,
     state: State<'_, Shared>,
 ) -> Result<CaptureResult, String> {
+    require_pointer_controls(&window)?;
     let started = Instant::now();
     {
         let mut runtime = lock(&state);
@@ -1576,6 +1751,14 @@ async fn capture_target(
     }
 
     tokio::time::sleep(Duration::from_millis(960)).await;
+    let app = window.app_handle().clone();
+    on_main(&app, move || finish_capture(&window, started)).await
+}
+
+fn finish_capture(window: &WebviewWindow, started: Instant) -> Result<CaptureResult, String> {
+    let app = window.app_handle();
+    refresh_displays(app);
+    let state = app.state::<Shared>();
     let (step, screen) = {
         let runtime = lock(&state);
         let session = runtime
@@ -1585,7 +1768,7 @@ async fn capture_target(
             .ok_or("采样已取消。")?;
         (session.step().unwrap(), session.screen)
     };
-    let target = screen_target(&window, step.point);
+    let target = macos::exercise_target(window, screen, step.point);
 
     let mut runtime = lock(&state);
     let session = runtime
@@ -1594,10 +1777,27 @@ async fn capture_target(
         .filter(|session| session.capture == Some(started))
         .ok_or("采样已取消。")?;
     session.capture = None;
-    if screen != Screen::primary() {
-        return Err("主显示器已改变。请退出并重新校准。".into());
+    if macos::display_reconfiguring() {
+        return Err(DISPLAY_RECONFIGURING.into());
     }
-    let target = target?;
+    if !runtime.selected_screen_is_current() {
+        let action = runtime.update_selected_screen(None);
+        drop(runtime);
+        dispatch_main_action(app, action);
+        return Err("目标显示器已改变，请重新校准。".into());
+    }
+    let target = match target {
+        Ok(target) => target,
+        Err(error) => {
+            let action = runtime.cancel_exercises();
+            runtime.display_revision = runtime.display_revision.wrapping_add(1);
+            runtime.message = Some(error.clone());
+            runtime.publish();
+            drop(runtime);
+            dispatch_main_action(app, action);
+            return Err(error);
+        }
+    };
     let settled_at = started + Duration::from_millis(260);
     let frames: Vec<&Features> = runtime
         .recent
@@ -1647,10 +1847,12 @@ async fn capture_target(
             None
         }
     };
-    runtime.closing_exercise = true;
+    let action = runtime.end_exercise();
     runtime.publish();
     drop(runtime);
-    close_manual_exercise(&window, &state)?;
+    if matches!(action, Some(MainAction::CloseExercise)) {
+        close_exercise(app)?;
+    }
     Ok(CaptureResult {
         next: None,
         message,
@@ -1687,6 +1889,8 @@ pub fn run() {
                 .build(),
         )
         .setup(move |app| {
+            macos::watch_display_changes();
+            refresh_displays(app.handle());
             let registered = app.global_shortcut().register(shortcut).is_ok();
             let state = app.state::<Shared>();
             let mut runtime = lock(&state);
@@ -1704,6 +1908,8 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(220));
+                let display_handle = handle.clone();
+                let _ = handle.run_on_main_thread(move || refresh_displays(&display_handle));
                 let (action, request) = {
                     let state = handle.state::<Shared>();
                     let mut runtime = lock(&state);
@@ -1721,6 +1927,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             subscribe,
             set_control_mode,
+            set_target_display,
             set_eye_damping,
             start_camera,
             stop_camera,
@@ -2015,9 +2222,86 @@ mod tests {
     }
 
     #[test]
+    fn target_follows_the_main_display_until_explicitly_selected() {
+        let first = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        let second = Screen::fixture(2, [-1920.0, -200.0], 1920.0, 1080.0);
+        let mut runtime = Runtime::default();
+        let displays = |main| {
+            vec![
+                Display::fixture(first, main == 1),
+                Display::fixture(second, main == 2),
+            ]
+        };
+
+        runtime.update_displays(displays(1));
+        assert_eq!(runtime.selected_screen, Some(first));
+        runtime.update_displays(displays(2));
+        assert_eq!(runtime.selected_screen, Some(second));
+        runtime.preferred_display_id = Some(2);
+        let revision = runtime.display_revision;
+        runtime.update_displays(displays(1));
+        assert_eq!(runtime.selected_screen, Some(second));
+        assert_eq!(runtime.display_revision, revision);
+    }
+
+    #[test]
+    fn display_disconnection_cancels_capture_and_never_falls_back_to_main() {
+        let main = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        let external = Screen::fixture(2, [0.0, -1080.0], 1920.0, 1080.0);
+        let mut runtime = Runtime {
+            preferred_display_id: Some(external.id),
+            ..Runtime::default()
+        };
+        let online = || {
+            vec![
+                Display::fixture(main, true),
+                Display::fixture(external, false),
+            ]
+        };
+        runtime.update_displays(online());
+        runtime.session = Some(Session {
+            mode: Exercise::Verify,
+            screen: external,
+            samples: Vec::new(),
+            capture: Some(Instant::now()),
+        });
+        runtime.exercise_frame = Some(WindowFrame::default());
+        runtime.neutral = Some((external, [0.0; 2]));
+        runtime.point = Some([0.5, 0.5]);
+        runtime.pointer_enabled = true;
+        let revision = runtime.display_revision;
+
+        assert!(matches!(
+            runtime.update_displays(vec![Display::fixture(main, true)]),
+            Some(MainAction::CloseExercise)
+        ));
+        assert_eq!(runtime.selected_screen, None);
+        assert_ne!(runtime.display_revision, revision);
+        assert!(!runtime.pointer_enabled);
+        assert!(runtime.session.is_none());
+        assert!(runtime.neutral.is_none());
+        assert!(runtime.point.is_none());
+        assert!(runtime.calibration_active());
+        assert!(runtime.update_displays(online()).is_none());
+        assert_eq!(runtime.selected_screen, Some(external));
+        assert!(runtime.neutral.is_none());
+
+        runtime.exercise_frame = None;
+        runtime.closing_exercise = false;
+        runtime.head_capture = Some(Instant::now());
+        let revised = Screen::fixture(external.id, [-1920.0, 0.0], 1920.0, 1080.0);
+        runtime.update_displays(vec![
+            Display::fixture(main, true),
+            Display::fixture(revised, false),
+        ]);
+        assert_eq!(runtime.selected_screen, Some(revised));
+        assert!(runtime.head_capture.is_none());
+    }
+
+    #[test]
     fn rejected_reset_times_out_without_replacing_the_mapping_or_resuming_the_pointer() {
         let now = Instant::now();
-        let screen = Screen::primary();
+        let screen = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
         let features = |[x, y]: Point| [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0];
         let mapping =
             Mapping::fit(&CALIBRATION_POINTS.map(|point| (features(point), point))).unwrap();
@@ -2033,7 +2317,7 @@ mod tests {
             mapping: Some((screen, mapping)),
             stream: Some(Channel::new(|_| Ok(()))),
             reset: Some(reset),
-            reset_fullscreen: Some(1),
+            exercise_frame: Some(WindowFrame::default()),
             ..Runtime::default()
         };
         let mut corner = features(RESET_POINTS[1]);
@@ -2049,7 +2333,7 @@ mod tests {
         reset.expires = now;
         assert!(matches!(
             runtime.watchdog(),
-            Some(MainAction::CloseReset(1))
+            Some(MainAction::CloseExercise)
         ));
         assert!(runtime.reset.is_none());
         assert!(!runtime.pointer_enabled);

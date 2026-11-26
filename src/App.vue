@@ -9,10 +9,19 @@ type Camera = 'off' | 'starting' | 'running' | 'error'
 type Quality = 'searching' | 'eyes_closed' | 'tracked' | 'stale'
 type PointerAccess = 'missing' | 'waiting' | 'granted' | 'restart_required' | 'restarting'
 
+interface Display {
+  id: number
+  name: string
+  primary: boolean
+}
+
 interface Snapshot {
   camera: Camera
   quality: Quality
   controlMode: ControlMode
+  displays: Display[]
+  selectedDisplayId: number | null
+  displayRevision: number
   eyeDamping: number
   calibrated: boolean
   pointerEnabled: boolean
@@ -35,10 +44,13 @@ interface ResetStep extends Step {
   id: number
 }
 
-const state = ref<Omit<Snapshot, 'pointerAccess'> & { pointerAccess: PointerAccess | null }>({
+const state = ref<Omit<Snapshot, 'pointerAccess' | 'displays'> & { pointerAccess: PointerAccess | null; displays: Display[] | null }>({
   camera: 'off',
   quality: 'searching',
   controlMode: 'eye',
+  displays: null,
+  selectedDisplayId: null,
+  displayRevision: 0,
   eyeDamping: 50,
   calibrated: false,
   pointerEnabled: false,
@@ -52,6 +64,7 @@ const state = ref<Omit<Snapshot, 'pointerAccess'> & { pointerAccess: PointerAcce
 })
 const connected = ref(false)
 const pending = ref(false)
+const requestedDisplayId = ref<number | null>(null)
 const sampling = ref(false)
 const capturingNeutral = ref(false)
 const eyeDampingDraft = ref<number | null>(null)
@@ -66,6 +79,7 @@ let exerciseSequence = 0
 let activateAfterClose = ""
 let resetFocus = ""
 let savingEyeDamping = false
+let restoreDisplayFocus = false
 
 const tracked = computed(() => state.value.camera === 'running' && state.value.quality === 'tracked')
 const headControl = computed(() => state.value.controlMode === 'head')
@@ -78,6 +92,28 @@ const isStarting = computed(() => state.value.camera === 'starting')
 const cameraActive = computed(() => state.value.camera === 'running' || isStarting.value)
 const authorizing = computed(() => state.value.pointerAccess === 'waiting' || state.value.pointerAccess === 'restarting')
 const notice = computed(() => message.value || state.value.message)
+const selectedDisplay = computed(() => state.value.displays?.find(({ id }) => id === state.value.selectedDisplayId))
+const displayReady = computed(() => connected.value && Boolean(selectedDisplay.value) && requestedDisplayId.value === null)
+const displayChangePending = computed(() => pending.value || requestedDisplayId.value !== null)
+const displayOptions = computed(() => (state.value.displays ?? []).map((display, _, displays) => {
+  const matching = displays.filter(({ name }) => name === display.name)
+  const suffix = matching.length > 1 ? ` ${matching.filter(({ id }) => id < display.id).length + 1}` : ''
+  return { id: display.id, label: `${display.name}${suffix}${display.primary ? '（主屏幕）' : ''}` }
+}))
+const displayPlaceholder = computed(() => {
+  if (!state.value.displays) return message.value ? '屏幕列表不可用' : '正在读取屏幕…'
+  return state.value.displays.length ? '请选择屏幕' : '未检测到屏幕'
+})
+const displayHint = computed(() => {
+  if (!state.value.displays) return ''
+  if (requestedDisplayId.value !== null) return '正在切换屏幕…'
+  if (!state.value.displays.length) return '连接屏幕后即可校准和移动指针。'
+  if (!selectedDisplay.value) return '选择屏幕后即可校准和移动指针。'
+  if (state.value.calibrated) {
+    return headControl.value ? '切换屏幕后，指针会暂停，需要重新设定正面位置。' : '切换屏幕后，指针会暂停，需要重新校准。'
+  }
+  return '指针只在所选屏幕上移动。'
+})
 const status = computed(() => {
   if (isStarting.value) return '正在打开相机'
   if (state.value.camera === 'error') return '相机需要检查'
@@ -129,6 +165,30 @@ async function changeControlMode(event: Event) {
   if (!await action('set_control_mode', { controlMode })) select.value = state.value.controlMode
 }
 
+async function changeTargetDisplay(event: Event) {
+  const select = event.currentTarget as HTMLSelectElement
+  if (displayChangePending.value || !select.value) return
+  const displayId = Number(select.value)
+  if (displayId === selectedDisplay.value?.id) return
+  restoreDisplayFocus = select === document.activeElement
+  requestedDisplayId.value = displayId
+  if (!await action('set_target_display', { displayId })) {
+    requestedDisplayId.value = null
+    select.value = String(selectedDisplay.value?.id ?? '')
+  }
+}
+
+// Channel snapshots can arrive before or after the selection command resolves.
+watch(() => state.value.selectedDisplayId, (id) => {
+  if (id === requestedDisplayId.value) requestedDisplayId.value = null
+}, { flush: 'sync' })
+
+watch(displayChangePending, (changing) => {
+  if (changing || !restoreDisplayFocus) return
+  restoreDisplayFocus = false
+  if (document.activeElement === document.body) document.getElementById('target-display')?.focus()
+}, { flush: 'post' })
+
 async function changeEyeDamping(event: Event) {
   eyeDampingDraft.value = (event.currentTarget as HTMLInputElement).valueAsNumber
   eyeDampingError.value = ''
@@ -148,7 +208,7 @@ async function changeEyeDamping(event: Event) {
 }
 
 async function captureNeutral() {
-  if (pending.value) return
+  if (pending.value || !displayReady.value) return
   capturingNeutral.value = true
   try {
     await action('capture_neutral')
@@ -158,12 +218,17 @@ async function captureNeutral() {
 }
 
 async function begin(nextMode: Mode, event: MouseEvent) {
-  if (pending.value) return
+  if (pending.value || !displayReady.value) return
+  const revision = state.value.displayRevision
   pending.value = true
   message.value = ''
   activateAfterClose = (event.currentTarget as HTMLElement).id
   try {
     const firstStep = await invoke<Step>('begin_exercise', { mode: nextMode })
+    if (state.value.displayRevision !== revision) {
+      await invoke('cancel_exercise')
+      return
+    }
     mode.value = nextMode
     step.value = firstStep
     await nextTick()
@@ -172,15 +237,32 @@ async function begin(nextMode: Mode, event: MouseEvent) {
     message.value = errorText(error)
   } finally {
     pending.value = false
+    if (!activeStep.value && activateAfterClose) await leaveExercise()
   }
+}
+
+function restoreExerciseFocus(id: string) {
+  const target = document.getElementById(id)
+  const display = document.getElementById('target-display')
+  if (target && !target.matches(':disabled')) target.focus()
+  else if (display && !display.matches(':disabled')) display.focus()
+  else document.getElementById('camera-toggle')?.focus()
 }
 
 async function leaveExercise() {
   step.value = null
   await nextTick()
-  document.getElementById(activateAfterClose)?.focus()
+  restoreExerciseFocus(activateAfterClose)
   activateAfterClose = ""
 }
+
+watch(() => state.value.displayRevision, () => {
+  if (!step.value) return
+  exerciseSequence += 1
+  sampling.value = false
+  message.value = ''
+  void leaveExercise()
+})
 
 async function capture() {
   if (!step.value || sampling.value || pending.value || !tracked.value) return
@@ -246,7 +328,7 @@ watch(authorizing, (open) => {
 watch(() => resetStep.value && `${resetStep.value.id}:${resetStep.value.index}`, async (key, previous) => {
   if (!key) {
     await nextTick()
-    if (!resetStep.value) document.getElementById(resetFocus)?.focus()
+    if (!resetStep.value) restoreExerciseFocus(resetFocus)
     resetFocus = ''
     return
   }
@@ -358,6 +440,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </select>
           </div>
 
+          <div class="control-row display-control">
+            <h2><label for="target-display">控制屏幕</label></h2>
+            <select id="target-display" class="button control-select" :value="requestedDisplayId ?? selectedDisplay?.id ?? ''"
+              :disabled="!connected || displayChangePending || authorizing || !displayOptions.length"
+              :title="selectedDisplay?.name"
+              aria-describedby="target-display-hint" @change="changeTargetDisplay">
+              <option value="" disabled>{{ displayPlaceholder }}</option>
+              <option v-for="display in displayOptions" :key="display.id" :value="display.id">{{ display.label }}</option>
+            </select>
+            <p v-show="displayHint" id="target-display-hint" role="status">{{ displayHint }}</p>
+          </div>
+
           <div class="control-row">
             <div>
               <h2>
@@ -373,10 +467,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div class="control-row">
             <div>
               <h2>摄像头</h2>
-              <p>请正对主屏幕，保持脸部光线均匀。</p>
+              <p>调整相机和光线，让脸部清晰可见。</p>
             </div>
-            <button v-if="cameraActive" type="button" class="button" :disabled="pending" @click="action('stop_camera')">关闭相机</button>
-            <button v-else type="button" class="button" :class="{ accent: state.pointerAccess === 'granted' && !state.calibrated }" :disabled="!connected || pending" @click="action('start_camera')">开启相机</button>
+            <button v-if="cameraActive" id="camera-toggle" type="button" class="button" :disabled="pending" @click="action('stop_camera')">关闭相机</button>
+            <button v-else id="camera-toggle" type="button" class="button" :class="{ accent: state.pointerAccess === 'granted' && !state.calibrated }" :disabled="!connected || pending" @click="action('start_camera')">开启相机</button>
           </div>
 
           <div v-if="headControl" class="control-row">
@@ -384,7 +478,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <h2>正面位置 <span v-if="state.calibrated" class="done">已设定</span></h2>
               <p>面向屏幕，保持稳定直到采样完成。转头、抬头或低头控制方向，回正即停。</p>
             </div>
-            <button type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!tracked || pending" @click="captureNeutral">
+            <button type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!displayReady || !tracked || pending" @click="captureNeutral">
               {{ capturingNeutral ? '正在采样…' : state.calibrated ? '重新设定正面位置' : '设定正面位置' }}
             </button>
           </div>
@@ -395,10 +489,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <p>逐个注视目标并按空格。移动相机或调整坐姿后可重新校准。</p>
             </div>
             <div class="button-group">
-              <button id="calibrate" type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!tracked || pending" @click="begin('calibrate', $event)">
+              <button id="calibrate" type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!displayReady || !tracked || pending" @click="begin('calibrate', $event)">
                 {{ state.calibrated ? '重新校准' : '开始九点校准' }}
               </button>
-              <button v-if="state.calibrated" id="verify" type="button" class="button quiet" :disabled="!tracked || pending" @click="begin('verify', $event)">验证精度</button>
+              <button v-if="state.calibrated" id="verify" type="button" class="button quiet" :disabled="!displayReady || !tracked || pending" @click="begin('verify', $event)">验证精度</button>
             </div>
             <p v-if="state.validation" class="results" role="status">
               五点验证误差 · 中位数 {{ state.validation.medianPoints }} pt · P90 {{ state.validation.p90Points }} pt
@@ -427,7 +521,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               </template>
             </div>
             <button v-if="state.pointerEnabled" type="button" class="button accent" :disabled="pending" @click="action('pause_pointer')">暂停指针</button>
-            <button v-else type="button" class="button" :class="{ accent: state.calibrated && tracked }" :disabled="!state.calibrated || !tracked || !state.pauseAvailable || pending" @click="action('enable_pointer')">启用指针</button>
+            <button v-else type="button" class="button" :class="{ accent: state.calibrated && tracked }" :disabled="!displayReady || !state.calibrated || !tracked || !state.pauseAvailable || pending" @click="action('enable_pointer')">启用指针</button>
             <p v-if="!state.pauseAvailable" class="results">暂停快捷键不可用。释放该组合键后重启应用。</p>
           </div>
         </section>
@@ -437,7 +531,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
     <footer class="app-footer">
       <span>相机画面仅在本机处理</span>
-      <span>macOS · 单屏</span>
+      <span>macOS</span>
     </footer>
   </div>
 

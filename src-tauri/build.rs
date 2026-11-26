@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/accessibility_access.m");
     println!("cargo:rerun-if-changed=src/camera_access.m");
+    println!("cargo:rerun-if-changed=src/display_window.m");
     println!("cargo:rerun-if-changed=src/snake_window.m");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
         cc::Build::new()
@@ -12,6 +13,10 @@ fn main() {
             .flag("-fobjc-arc")
             .compile("camera_access");
         println!("cargo:rustc-link-lib=framework=AVFoundation");
+        cc::Build::new()
+            .file("src/display_window.m")
+            .flag("-fobjc-arc")
+            .compile("display_window");
         cc::Build::new()
             .file("src/snake_window.m")
             .flag("-fobjc-arc")
