@@ -110,8 +110,15 @@ export class SnakeGame {
     // Keep each move shorter than the contact radius, even after a delayed frame.
     let remaining = 0
     if (distance > STOP_DISTANCE) {
-      remaining = this.gait === 'jump' ? this.hopDistance(distance, previousTime)
-        : Math.min(distance, elapsed * (this.gait === 'crawl' ? 150 : 310))
+      if (this.gait === 'jump') {
+        remaining = this.hopDistance(distance, previousTime)
+      } else {
+        // At the gait limits, allow half a second of walking and one second of crawling.
+        const speed = this.gait === 'crawl'
+          ? Math.max(150, this.displayWidth / 5)
+          : Math.max(310, this.displayWidth * 2 / 5)
+        remaining = Math.min(distance, elapsed * speed)
+      }
     }
     while (remaining > 0) {
       const step = Math.min(MAX_STEP, remaining)

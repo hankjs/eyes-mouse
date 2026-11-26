@@ -40,6 +40,26 @@ test('gait thresholds use Euclidean distance and the single display width', () =
   }
 })
 
+test('ground chases on a wide display leave time for pointer sampling and drawing', () => {
+  const displayWidth = 5120
+  const motionBudget = 1.75
+  for (const fps of [30, 60]) {
+    for (const [distance, expectedGaits] of [[displayWidth / 5, ['crawl']], [displayWidth * 2 / 5, ['walk', 'crawl']]]) {
+      const game = new SnakeGame(5000, 2160, () => 0, displayWidth)
+      const target = { x: game.head.x + distance, y: game.head.y }
+      game.setTarget(target)
+      const gaits = new Set()
+      for (let frame = 0; frame < Math.floor(fps * motionBudget); frame++) {
+        if (!game.advance(1 / fps)) break
+        gaits.add(game.gait)
+      }
+      assert.equal(game.gait, 'idle', `${distance}px at ${fps}Hz should finish within ${motionBudget}s`)
+      assert.ok(Math.hypot(target.x - game.head.x, target.y - game.head.y) <= 1)
+      assert.deepEqual([...gaits], expectedGaits)
+    }
+  }
+})
+
 test('a long portrait diagonal stretches four hops and reaches the target on the last landing', () => {
   const game = new SnakeGame(420, 1500, () => 0)
   moveTo(game, 390, 1450)
