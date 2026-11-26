@@ -65,6 +65,35 @@ let polling = false
 let readingPointer = false
 let pollSession = 0
 let pollTimer: number | undefined
+let foodTimer: number | undefined
+let foodDeadline: number | undefined
+let foodPausedAt = document.hidden ? performance.now() : null
+let foodPausedDuration = 0
+
+function foodClock() {
+  return (foodPausedAt ?? performance.now()) - foodPausedDuration
+}
+
+function cancelFoodTimer() {
+  window.clearTimeout(foodTimer)
+  foodTimer = undefined
+  foodDeadline = undefined
+}
+
+function scheduleFoodUpdate() {
+  if (!game || animationsPaused.value || document.hidden) return
+  const deadline = game.nextFoodUpdate
+  if (deadline === foodDeadline) return
+  cancelFoodTimer()
+  foodDeadline = deadline
+  foodTimer = window.setTimeout(() => {
+    foodTimer = undefined
+    foodDeadline = undefined
+    if (!game || animationsPaused.value || document.hidden) return
+    game.updateFood()
+    updateFood()
+  }, Math.max(0, Math.ceil(deadline - foodClock())))
+}
 
 function updateFood() {
   const nextFood = game?.food ?? []
@@ -72,6 +101,7 @@ function updateFood() {
   if (nextFood.length !== displayedFood.length || nextFood.some((pellet, index) => pellet !== displayedFood[index])) {
     food.value = nextFood.slice()
   }
+  scheduleFoodUpdate()
 }
 
 function paintLights(seconds: number, snap = false) {
@@ -242,6 +272,7 @@ function resetGame() {
   cancelMovement()
   cancelIdle()
   cancelLights()
+  cancelFoodTimer()
   lightAnchor = null
   lightTime = 0
   cursor = null
@@ -249,7 +280,7 @@ function resetGame() {
   displayFacing = 1
   horizontalOffset = 0
   nextGesture = 0
-  game = width && height ? new SnakeGame(width, height, Math.random, window.screen.width || width) : null
+  game = width && height ? new SnakeGame(width, height, Math.random, window.screen.width || width, foodClock) : null
   drawScene({ snap: true })
   scheduleIdle()
 }
@@ -354,6 +385,8 @@ async function pollPointer(session: number) {
 
 function stopPolling() {
   animationsPaused.value = true
+  foodPausedAt ??= performance.now()
+  cancelFoodTimer()
   cancelLights()
   polling = false
   pollSession++
@@ -370,6 +403,11 @@ function updatePolling() {
   if (animationsPaused.value) {
     animationsPaused.value = false
     if (paintLights(0, true)) scheduleLights()
+  }
+  if (foodPausedAt !== null) {
+    foodPausedDuration += performance.now() - foodPausedAt
+    foodPausedAt = null
+    scheduleFoodUpdate()
   }
   if (isTauri() && !polling) {
     polling = true
@@ -416,7 +454,7 @@ onUnmounted(() => {
   <canvas ref="field" class="playfield" aria-hidden="true"></canvas>
   <canvas ref="character" class="character" aria-hidden="true"></canvas>
   <!-- Pellets stay visible when their positions overlap the character. -->
-  <span v-for="{ x, y, radius, tier } in food" :key="`${x},${y},${tier}`" class="pellet" aria-hidden="true"
+  <span v-for="{ x, y, radius, tier, expiresAt } in food" :key="`${x},${y},${tier},${expiresAt}`" class="pellet" aria-hidden="true"
     :class="{ paused: animationsPaused }" :data-tier="tier"
     :style="{ left: `${x}px`, top: `${y}px`, '--pellet-diameter': `${2 * radius}px` }"></span>
 </template>

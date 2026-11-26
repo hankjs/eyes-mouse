@@ -8,6 +8,7 @@ export interface Point {
 export interface Food extends Point {
   radius: number
   tier: LightTier
+  expiresAt: number
 }
 
 export type Gait = 'idle' | 'crawl' | 'walk' | 'jump'
@@ -22,6 +23,7 @@ export const DEFAULT_SNAKE_SIZE = 200
 export const HOP_TAKEOFF = 0.11
 export const HOP_LANDING = 0.42
 export const HOP_DURATION = 0.54
+export const FOOD_LIFETIME_MS = 15_000
 
 const MAX_HOPS = 4
 const NOMINAL_HOP_WIDTH = 0.34
@@ -29,6 +31,9 @@ const WARMUP_SHARE = 0.12
 const MAX_STEP = 4
 const STOP_DISTANCE = 1
 const FOOD_GAP = 8
+const MAX_FOOD = 9
+const MAX_REPLACEMENTS = 3
+const FOOD_RETRY_MS = 250
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
@@ -55,7 +60,6 @@ export class SnakeGame {
   gaitTime = 0
   facing: Facing = 1
 
-  private distanceTravelled = 0
   private target: Point | null = null
   private hopCount = 0
   private hopAim: Point | null = null
@@ -66,10 +70,22 @@ export class SnakeGame {
     private readonly height: number,
     private readonly random = Math.random,
     private readonly displayWidth = width,
+    private readonly now = () => performance.now(),
   ) {
     this.head = { x: width / 2, y: height / 2 }
     this.orbit = new LightOrbit(width, height)
-    this.spawnBatch()
+    this.refillFood(0, this.now())
+  }
+
+  get nextFoodUpdate() {
+    return this.food[0]?.expiresAt ?? this.retryFoodAt
+  }
+
+  updateFood() {
+    const now = this.now()
+    const before = this.food.length
+    this.expireFood(now)
+    this.refillFood(before - this.food.length, now)
   }
 
   setTarget(point: Point | null) {
@@ -90,6 +106,16 @@ export class SnakeGame {
   }
 
   advance(seconds: number): boolean {
+    const now = this.now()
+    const before = this.food.length
+    this.expireFood(now)
+    const moving = this.move(seconds)
+    // Defer replacements until the sweep ends so one frame only collects existing food.
+    this.refillFood(before - this.food.length, now)
+    return moving
+  }
+
+  private move(seconds: number): boolean {
     const destination = this.target
     if (!destination) return false
     const dx = destination.x - this.head.x
@@ -122,15 +148,11 @@ export class SnakeGame {
         y: this.head.y + (dy / distance) * step,
       }
       this.head = next
-      this.distanceTravelled += step
       const bite = this.food.findIndex((pellet) => within(next, pellet, HEAD_RADIUS + pellet.radius))
       if (bite >= 0) {
         const [pellet] = this.food.splice(bite, 1)
         this.orbit.add(pellet)
         this.score++
-      }
-      if (!this.food.length && (bite >= 0 || this.distanceTravelled >= this.retryFoodAt)) {
-        this.spawnBatch()
       }
       remaining -= step
     }
@@ -187,16 +209,41 @@ export class SnakeGame {
     return Math.min(distance * frameShare / budget, maxHop * frameShare)
   }
 
-  private spawnBatch() {
-    const tiers: LightTier[] = [0, 1, 2]
-    const count = 1 + Math.floor(this.random() * tiers.length)
-    while (this.food.length < count && tiers.length) {
-      const [tier] = tiers.splice(Math.floor(this.random() * tiers.length), 1)
-      const radius = LIGHT_TIERS[tier].radius
-      const point = this.openSpot(radius)
-      if (point) this.food.push({ ...point, radius, tier })
+  private expireFood(now: number) {
+    let expired = 0
+    for (const pellet of this.food) {
+      if (pellet.expiresAt > now) break
+      expired++
     }
-    this.retryFoodAt = this.distanceTravelled + 48
+    if (expired) this.food.splice(0, expired)
+  }
+
+  private refillFood(removed: number, now: number) {
+    let replacements = 0
+    for (let index = 0; index < removed; index++) {
+      replacements += Math.floor(this.random() * (MAX_REPLACEMENTS + 1))
+    }
+    this.spawnFood(replacements, now)
+    if (!this.food.length && (removed || now >= this.retryFoodAt)) {
+      this.spawnFood(1 + Math.floor(this.random() * MAX_FOOD), now)
+      this.retryFoodAt = now + FOOD_RETRY_MS
+    }
+  }
+
+  private spawnFood(count: number, now: number) {
+    const target = Math.min(this.food.length + count, MAX_FOOD)
+    const expiresAt = now + FOOD_LIFETIME_MS
+    while (this.food.length < target) {
+      const before = this.food.length
+      const tiers: LightTier[] = [0, 1, 2]
+      while (this.food.length < target && tiers.length) {
+        const [tier] = tiers.splice(Math.floor(this.random() * tiers.length), 1)
+        const radius = LIGHT_TIERS[tier].radius
+        const point = this.openSpot(radius)
+        if (point) this.food.push({ ...point, radius, tier, expiresAt })
+      }
+      if (this.food.length === before) break
+    }
   }
 
   private openSpot(radius: number): Point | null {

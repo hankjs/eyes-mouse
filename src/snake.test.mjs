@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { CHARACTER_INSET, HEAD_RADIUS, HOP_DURATION, HOP_LANDING, SnakeGame } from './snake.ts'
+import { CHARACTER_INSET, FOOD_LIFETIME_MS, HEAD_RADIUS, HOP_DURATION, HOP_LANDING, SnakeGame } from './snake.ts'
 import { LIGHT_TIERS, LightOrbit } from './lights.ts'
 
 function moveTo(game, x, y, frameTime = 1 / 60) {
@@ -342,11 +342,14 @@ test('reduced motion follows instantly, freezes the orbit, and shows a finite st
 })
 
 test('a delayed frame collects a pellet swept between its start and end positions', () => {
-  const game = new SnakeGame(10000, 1000, () => 0)
+  let now = 0
+  const game = new SnakeGame(10000, 1000, () => 0, 10000, () => now)
   const start = game.head.x
-  const food = pellet(1, start + 100, game.head.y)
-  game.food.splice(0, game.food.length, food)
+  const expired = { ...pellet(2, start + 30, game.head.y), expiresAt: FOOD_LIFETIME_MS }
+  const food = { ...pellet(1, start + 100, game.head.y), expiresAt: FOOD_LIFETIME_MS + 500 }
+  game.food.splice(0, game.food.length, expired, food)
   game.setTarget({ x: start + 3200, y: game.head.y })
+  now = FOOD_LIFETIME_MS
   assert.equal(game.advance(1), true)
   assert.ok(game.head.x > food.x + HEAD_RADIUS + food.radius)
   assert.equal(game.score, 1)
@@ -354,19 +357,21 @@ test('a delayed frame collects a pellet swept between its start and end position
   assert.deepEqual({ x: game.orbit.lights[2].x, y: game.orbit.lights[2].y }, { x: food.x, y: food.y })
 })
 
-test('an exhausted batch is replaced with distinct sized food in open spots', () => {
-  const firstBatch = [0, 0, 0.65, 0.5]
-  const game = new SnakeGame(1000, 600, () => firstBatch.shift() ?? 0.999)
-  assert.equal(game.food.length, 1)
+test('picking up a light spawns replacements even when another remains', () => {
+  const values = [0.12, 0, 0.65, 0.5, 0, 0.15, 0.3]
+  const game = new SnakeGame(1000, 600, () => values.shift() ?? 0.999)
+  assert.equal(game.food.length, 2)
   assert.deepEqual(tiers(game.orbit), [0, 0])
-  const food = game.food[0]
+  const [food, survivor] = game.food
   game.orbit.follow({ ...anchor, x: 600 }, 0, stopped)
   moveTo(game, food.x, food.y)
   assert.equal(game.score, 1)
   assert.deepEqual(tiers(game.orbit), [1])
-  assert.equal(game.food.length, 3)
-  assert.equal(new Set(game.food.map(({ tier }) => tier)).size, 3)
-  for (const light of game.food) {
+  assert.equal(game.food.length, 4)
+  assert.equal(game.food[0], survivor)
+  const replacements = game.food.slice(1)
+  assert.equal(new Set(replacements.map(({ tier }) => tier)).size, 3)
+  for (const light of replacements) {
     assert.equal(light.radius, LIGHT_TIERS[light.tier].radius)
     assert.ok(Math.hypot(light.x - game.head.x, light.y - game.head.y) > light.radius + HEAD_RADIUS)
     assert.equal(game.orbit.overlaps(light, light.radius), false)
@@ -374,19 +379,79 @@ test('an exhausted batch is replaced with distinct sized food in open spots', ()
       if (other !== light) assert.ok(Math.hypot(light.x - other.x, light.y - other.y) > light.radius + other.radius)
     }
   }
-  const next = game.food[0]
-  moveTo(game, next.x, next.y)
-  assert.equal(game.score, 2)
-  assert.deepEqual(tiers(game.orbit), [1, next.tier])
 })
 
-test('food placement retries as the cat moves away from previously blocked spots', () => {
-  const game = new SnakeGame(130, 80, () => 0)
+test('each light expires at its own deadline while the cat is still', () => {
+  const values = [0.12, 0, 0.65, 0.5, 0, 0.15, 0.3]
+  let now = 0
+  const game = new SnakeGame(1000, 600, () => values.shift() ?? 0, 1000, () => now)
+  const [food, survivor] = game.food
+  now = 2000
+  values.push(0.25, 0, 0.88, 0.85)
+  moveTo(game, food.x, food.y)
+  const replacement = game.food[1]
+  assert.equal(replacement.expiresAt, now + FOOD_LIFETIME_MS)
+  assert.equal(game.nextFoodUpdate, FOOD_LIFETIME_MS)
+
+  game.setTarget(null)
+  now = FOOD_LIFETIME_MS - 1
+  game.updateFood()
+  assert.deepEqual(game.food, [survivor, replacement])
+  now++
+  game.updateFood()
+  assert.deepEqual(game.food, [replacement])
+  assert.equal(game.nextFoodUpdate, replacement.expiresAt)
+  now = replacement.expiresAt
+  game.updateFood()
+  assert.equal(game.food.length, 1)
+  assert.equal(game.food.includes(replacement), false)
+  assert.equal(game.score, 1)
+  assert.deepEqual(tiers(game.orbit), [1])
+})
+
+test('simultaneous expirations roll separately and share the nine-light limit', () => {
+  const values = [0.25]
+  let now = 0
+  const game = new SnakeGame(1000, 600, () => values.shift() ?? 0.999, 1000, () => now)
+  assert.equal(game.food.length, 3)
+  const initial = game.food.slice()
+  values.push(0, 0.25, 0.75)
+  now = FOOD_LIFETIME_MS
+  game.updateFood()
+  assert.equal(game.food.length, 4)
+  assert.ok(initial.every((food) => !game.food.includes(food)))
+  now += FOOD_LIFETIME_MS
+  game.updateFood()
+  assert.equal(game.food.length, 9)
+  const capped = game.food.slice()
+  game.updateFood()
+  assert.deepEqual(game.food, capped)
+  assert.equal(game.score, 0)
+  assert.deepEqual(tiers(game.orbit), [0, 0])
+})
+
+test('the empty-field refill can reach nine even when replacement rolls are zero', () => {
+  const values = [0]
+  let now = 0
+  const game = new SnakeGame(1000, 600, () => values.shift() ?? 0.999, 1000, () => now)
+  assert.equal(game.food.length, 1)
+  const [food] = game.food
+  values.push(0, 0.999)
+  moveTo(game, food.x, food.y)
+  assert.equal(game.score, 1)
+  assert.equal(game.food.length, 9)
+})
+
+test('food placement retries after the cat moves away from previously blocked spots', () => {
+  let now = 0
+  const game = new SnakeGame(130, 80, () => 0, 130, () => now)
   assert.equal(game.food.length, 0)
   moveTo(game, 92, 40)
+  now = game.nextFoodUpdate - 1
+  game.updateFood()
   assert.equal(game.food.length, 0)
-  game.setTarget({ x: 38, y: 40 })
-  for (let frame = 0; frame < 60 && game.food.length === 0; frame++) game.advance(1 / 60)
+  now++
+  game.updateFood()
   assert.equal(game.food.length, 1)
   assert.equal(game.score, 0)
   moveTo(game, 38, 40)

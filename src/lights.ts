@@ -79,7 +79,7 @@ export class LightOrbit {
     return this.reduced ? [] : this.effects.flatMap((effect) => effect.progress === 0 ? effect.inputs : [])
   }
 
-  add(food: Food) {
+  add(food: Pick<Food, 'x' | 'y' | 'tier'>) {
     this.append(food.tier, food)
     let tier = food.tier
     while (true) {
