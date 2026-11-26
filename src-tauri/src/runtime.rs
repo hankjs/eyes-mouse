@@ -636,7 +636,7 @@ impl Runtime {
             Gesture::TogglePointer => {
                 if self.pointer_enabled {
                     self.disarm();
-                    self.message = Some("已用顺时针眼动暂停指针。".into());
+                    self.message = Some("已用左右眼动手势暂停指针。".into());
                 } else {
                     self.message = match check_pointer_ready(self) {
                         Err(message) => Some(message),
@@ -645,7 +645,7 @@ impl Runtime {
                         }
                         Ok(()) => {
                             self.arm();
-                            Some("已用顺时针眼动启用指针。".into())
+                            Some("已用左右眼动手势启用指针。".into())
                         }
                     };
                 }

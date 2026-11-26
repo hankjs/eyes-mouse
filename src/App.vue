@@ -393,7 +393,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <h2>系统指针</h2>
               <p>用鼠标或触控板点击。随时按 <kbd>⌃</kbd><kbd>⌥</kbd><kbd>P</kbd> 暂停。</p>
               <template v-if="!headControl">
-                <p>校准后用视线画一圈。顺时针启用或暂停指针，逆时针退出应用。</p>
+                <p>校准后头部保持稳定，眼睛依次看左 → 右 → 左 → 右，每边稍停，即可启用或暂停指针。</p>
+                <p>用视线逆时针画一圈可退出应用。</p>
                 <p>快速眨眼三次，依次注视中央、左上和右下的亮点。</p>
               </template>
             </div>
