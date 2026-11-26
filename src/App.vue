@@ -35,14 +35,14 @@ interface ResetStep extends Step {
   id: number
 }
 
-const state = ref<Snapshot>({
+const state = ref<Omit<Snapshot, 'pointerAccess'> & { pointerAccess: PointerAccess | null }>({
   camera: 'off',
   quality: 'searching',
   controlMode: 'eye',
   eyeDamping: 50,
   calibrated: false,
   pointerEnabled: false,
-  pointerAccess: 'missing',
+  pointerAccess: null,
   pauseAvailable: true,
   point: null,
   validation: null,
@@ -360,9 +360,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
           <div class="control-row">
             <div>
-              <h2>辅助功能权限 <span v-if="state.pointerAccess === 'granted'" class="done">已授权</span></h2>
+              <h2>
+                辅助功能权限
+                <span v-if="state.pointerAccess === 'granted' || state.pointerAccess === 'restart_required'" class="done">已有权限</span>
+              </h2>
               <p v-if="state.pointerAccess === 'missing'">请先授权 Eyes Mouse 控制系统指针。</p>
-              <p v-else-if="state.pointerAccess === 'restart_required'">已授权。请按 ⌘Q 退出，再打开 Eyes Mouse。</p>
+              <p v-else-if="state.pointerAccess === 'restart_required'">请按 ⌘Q 退出，再打开 Eyes Mouse。</p>
             </div>
             <button v-if="state.pointerAccess === 'missing'" type="button" class="button accent" :disabled="!connected || pending" @click="action('request_pointer_access')">授权辅助功能</button>
           </div>

@@ -726,7 +726,7 @@ impl Runtime {
                         Err(message) => Some(message),
                         Ok(()) if !macos::can_move_pointer() => {
                             self.pointer_access = PointerAccess::without_post_access();
-                            Some("请先在主窗口完成辅助功能授权。".into())
+                            Some("指针未启用，请查看「辅助功能权限」状态。".into())
                         }
                         Ok(()) => {
                             self.pointer_access = PointerAccess::Granted;
