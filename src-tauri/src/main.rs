@@ -1,5 +1,6 @@
 mod calibration;
 mod gestures;
+mod head_compensation;
 mod macos;
 mod refinement;
 mod runtime;

@@ -4,7 +4,8 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 import { DEFAULT_SNAKE_SIZE, SNAKE_SIZE_MAX, SNAKE_SIZE_MIN, SNAKE_SIZE_STEP } from './snake'
 
 type Point = [number, number]
-type Mode = 'calibrate' | 'verify'
+type Mode = 'calibrate' | 'verify' | 'compensate'
+type CompensationPhase = 'reference' | 'turn' | 'nod' | 'shift' | 'depth'
 type ControlMode = 'eye' | 'head'
 type Camera = 'off' | 'starting' | 'running' | 'error'
 type Quality = 'searching' | 'eyes_closed' | 'tracked' | 'stale'
@@ -25,6 +26,9 @@ interface Snapshot {
   displayRevision: number
   eyeDamping: number
   calibrated: boolean
+  headCompensated: boolean
+  compensationOpen: boolean
+  compensationPhase: CompensationPhase | null
   pointerEnabled: boolean
   pointerAccess: PointerAccess
   pauseAvailable: boolean
@@ -58,6 +62,9 @@ const state = ref<Omit<Snapshot, 'pointerAccess' | 'displays'> & { pointerAccess
   displayRevision: 0,
   eyeDamping: 50,
   calibrated: false,
+  headCompensated: false,
+  compensationOpen: false,
+  compensationPhase: null,
   pointerEnabled: false,
   pointerAccess: null,
   pauseAvailable: true,
@@ -88,6 +95,7 @@ const mode = ref<Mode>('calibrate')
 const exercise = ref<HTMLElement | null>(null)
 const accessibilityDialog = ref<HTMLDialogElement | null>(null)
 let exerciseSequence = 0
+let startingCompensation = false
 let activateAfterClose = ""
 let resetFocus = ""
 let savingEyeDamping = false
@@ -101,6 +109,17 @@ const eyeDamping = computed(() => eyeDampingDraft.value ?? savedEyeDamping.value
 const snakeSize = computed(() => snakeSizeDraft.value ?? savedSnakeSize.value ?? state.value.snakeSize ?? DEFAULT_SNAKE_SIZE)
 const resetStep = computed(() => state.value.resetExercise)
 const activeStep = computed(() => resetStep.value ?? step.value)
+const compensating = computed(() => !resetStep.value && mode.value === 'compensate')
+const compensationInstruction = computed(() => {
+  if (!sampling.value) return '坐稳并看准中央亮点，按空格开始'
+  switch (state.value.compensationPhase) {
+    case 'turn': return '轻轻向左、向右转头'
+    case 'nod': return '轻轻抬头、低头'
+    case 'shift': return '脸朝向屏幕，头轻轻左右、上下平移'
+    case 'depth': return '稍微靠近屏幕，再稍微向后移'
+    default: return '保持头部稳定'
+  }
+})
 const resetLocation = computed(() => ['中央', '左上', '右下'][(resetStep.value?.index ?? 1) - 1])
 const isStarting = computed(() => state.value.camera === 'starting')
 const cameraActive = computed(() => state.value.camera === 'running' || isStarting.value)
@@ -250,6 +269,9 @@ async function captureNeutral() {
 
 async function begin(nextMode: Mode, event: MouseEvent) {
   if (pending.value || !displayReady.value) return
+  const sequence = ++exerciseSequence
+  startingCompensation = nextMode === 'compensate'
+  sampling.value = false
   const revision = state.value.displayRevision
   pending.value = true
   message.value = ''
@@ -260,6 +282,7 @@ async function begin(nextMode: Mode, event: MouseEvent) {
       await invoke('cancel_exercise')
       return
     }
+    if (sequence !== exerciseSequence) return
     mode.value = nextMode
     step.value = firstStep
     await nextTick()
@@ -267,6 +290,7 @@ async function begin(nextMode: Mode, event: MouseEvent) {
   } catch (error) {
     message.value = errorText(error)
   } finally {
+    startingCompensation = false
     pending.value = false
     if (!activeStep.value && activateAfterClose) await leaveExercise()
   }
@@ -295,22 +319,36 @@ watch(() => state.value.displayRevision, () => {
   void leaveExercise()
 })
 
+watch(() => state.value.compensationOpen, (open, wasOpen) => {
+  if (open || !wasOpen) return
+  if (!step.value && startingCompensation) {
+    exerciseSequence += 1
+    return
+  }
+  if (!step.value || !compensating.value) return
+  sampling.value = false
+  void leaveExercise()
+}, { flush: 'sync' })
+
 async function capture() {
   if (!step.value || sampling.value || pending.value || !tracked.value) return
   const sequence = exerciseSequence
+  const revision = state.value.displayRevision
   sampling.value = true
   message.value = ''
   try {
     const result = await invoke<{ next: Step | null; message: string | null }>('capture_target')
-    if (sequence !== exerciseSequence) return
+    if (sequence !== exerciseSequence || revision !== state.value.displayRevision) return
     message.value = result.message || ''
     if (result.next) {
       step.value = result.next
-    } else {
+    } else if (step.value) {
       await leaveExercise()
     }
   } catch (error) {
-    if (sequence === exerciseSequence) message.value = errorText(error)
+    if (sequence === exerciseSequence && revision === state.value.displayRevision && step.value) {
+      message.value = errorText(error)
+    }
   } finally {
     if (sequence === exerciseSequence) sampling.value = false
   }
@@ -326,7 +364,7 @@ async function cancel() {
     await invoke('cancel_exercise')
     pending.value = false
     message.value = ''
-    if (!resetting) await leaveExercise()
+    if (!resetting && step.value) await leaveExercise()
   } catch (error) {
     message.value = errorText(error)
   } finally {
@@ -400,16 +438,21 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 <template>
   <div v-if="activeStep" ref="exercise" class="exercise" tabindex="-1" aria-label="全屏注视目标">
     <div class="exercise-bar">
-      <span>{{ resetStep ? '快速回正' : mode === 'calibrate' ? '九点校准' : '五点精度验证' }} <strong>{{ activeStep.index }} / {{ activeStep.total }}</strong></span>
+      <span>
+        {{ compensating ? '头动补偿校准' : resetStep ? '快速回正' : mode === 'calibrate' ? '九点校准' : '五点精度验证' }}
+        <strong v-if="!compensating">{{ activeStep.index }} / {{ activeStep.total }}</strong>
+      </span>
       <button type="button" class="exercise-exit" @click="cancel">退出 <kbd>Esc</kbd></button>
     </div>
     <span class="exercise-dot" :class="{ sampling }" :style="coordinates(activeStep.point)" aria-hidden="true"></span>
-    <div class="exercise-instruction" aria-live="polite">
-      <strong v-if="sampling">正在采样，请保持视线和头部稳定</strong>
+    <div class="exercise-instruction" :class="{ 'compensation-instruction': compensating }" aria-live="polite">
+      <strong v-if="compensating && tracked">{{ compensationInstruction }}</strong>
+      <strong v-else-if="sampling && !compensating">正在采样，请保持视线和头部稳定</strong>
       <strong v-else-if="!tracked">请让相机看到双眼</strong>
       <strong v-else-if="resetStep">注视{{ resetLocation }}的亮点，保持头部稳定</strong>
       <strong v-else>看准亮点后按空格采样</strong>
       <p v-if="notice">{{ notice }}</p>
+      <p v-else-if="compensating && sampling">视线始终留在中央亮点。</p>
     </div>
   </div>
 
@@ -542,6 +585,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 {{ state.calibrated ? '重新校准' : '开始九点校准' }}
               </button>
               <button v-if="state.calibrated" id="verify" type="button" class="button quiet" :disabled="!displayReady || !tracked || pending" @click="begin('verify', $event)">验证精度</button>
+              <button v-if="state.calibrated" id="compensate" type="button" class="button quiet" :disabled="!displayReady || !tracked || pending" @click="begin('compensate', $event)">
+                {{ state.headCompensated ? '重新校准头动补偿' : '校准头动补偿' }}
+              </button>
             </div>
             <p v-if="state.validation" class="results" role="status">
               五点验证误差 · 中位数 {{ state.validation.medianPoints }} pt · P90 {{ state.validation.p90Points }} pt
@@ -600,3 +646,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     </template>
   </dialog>
 </template>
+
+<style scoped>
+.compensation-instruction {
+  inset: calc(50% + 36px) 18px auto;
+}
+</style>

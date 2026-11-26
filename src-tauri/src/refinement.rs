@@ -25,6 +25,10 @@ pub struct Refinement {
 }
 
 impl Refinement {
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
     pub fn record(
         &mut self,
         predicted: Point,

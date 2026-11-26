@@ -51,28 +51,46 @@ def eye_features(landmarks, indexes, width, height):
     return horizontal, vertical(iris), aperture
 
 
+def head_position(transform):
+    if transform.shape != (4, 4):
+        return None
+
+    x, y, z = map(float, transform[:3, 3])
+    # MediaPipe's virtual camera looks down negative Z and clips at 1 and 10,000.
+    depth = -z
+    if not (1 <= depth <= 10_000 and math.isfinite(x) and math.isfinite(y)):
+        return None
+    # Leave room for wide frames while rejecting positions far outside the view.
+    if max(abs(x), abs(y)) > 2 * depth:
+        return None
+    return [x / depth, y / depth, math.log(depth)]
+
+
 def extract(result, width, height):
     if not result.face_landmarks or not result.facial_transformation_matrixes:
-        return "searching", None, None, False
+        return "searching", None, None, False, None
 
-    rotation = result.facial_transformation_matrixes[0]
-    angles = rotation[0, 2], rotation[2, 2], rotation[1, 2], rotation[1, 0], rotation[1, 1]
+    transform = result.facial_transformation_matrixes[0]
+    if transform.ndim != 2 or min(transform.shape) < 3:
+        return "searching", None, None, False, None
+    angles = transform[0, 2], transform[2, 2], transform[1, 2], transform[1, 0], transform[1, 1]
     if not all(math.isfinite(value) for value in angles):
-        return "searching", None, None, False
-    yaw = math.atan2(rotation[0, 2], rotation[2, 2])
-    pitch = math.atan2(-rotation[1, 2], math.hypot(rotation[1, 0], rotation[1, 1]))
+        return "searching", None, None, False, None
+    yaw = math.atan2(transform[0, 2], transform[2, 2])
+    pitch = math.atan2(-transform[1, 2], math.hypot(transform[1, 0], transform[1, 1]))
     pose = [yaw, pitch]
+    position = head_position(transform)
 
     face = result.face_landmarks[0]
     eyes = [eye_features(face, indexes, width, height) for indexes in EYES]
     if any(eye is None or not all(math.isfinite(value) for value in eye) for eye in eyes):
-        return "searching", None, pose, False
+        return "searching", None, pose, False, position
     apertures = [eye[2] for eye in eyes]
     if min(apertures) < 0.1:
-        return "eyes_closed", None, pose, max(apertures) < 0.1
+        return "eyes_closed", None, pose, max(apertures) < 0.1, position
 
     features = [(eyes[0][i] + eyes[1][i]) / 2 for i in range(2)] + pose
-    return "tracked", features, pose, False
+    return "tracked", features, pose, False, position
 
 
 def run_camera(landmarker):
@@ -101,9 +119,9 @@ def run_camera(landmarker):
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 result = landmarker.detect_for_video(image, int(started_at * 1_000))
-                quality, features, pose, bilateral_closed = extract(result, width, height)
+                quality, features, pose, bilateral_closed, position = extract(result, width, height)
                 send("sample", timestamp=timestamp, quality=quality, features=features, pose=pose,
-                     bilateral_closed=bilateral_closed)
+                     bilateral_closed=bilateral_closed, head_position=position)
             time.sleep(max(0, 1 / FPS - (time.monotonic() - started_at)))
     finally:
         camera.release()
