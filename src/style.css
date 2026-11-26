@@ -19,7 +19,7 @@
 * { box-sizing: border-box; }
 body { margin: 0; min-width: 320px; }
 button { font: inherit; }
-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 h1, h2, p { margin: 0; }
 h1, h2 { text-wrap: balance; }
 p { text-wrap: pretty; }
@@ -156,6 +156,7 @@ h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.03em; line-height: 1.
 .button.accent:not(:disabled):hover { background: var(--accent-hover); border-color: var(--accent-hover); }
 .button.quiet:not(:hover) { border-color: transparent; }
 .button:disabled { color: oklch(0.52 0.012 32); background: oklch(0.97 0.003 32); cursor: default; }
+.control-select { font-family: inherit; max-width: 100%; }
 kbd {
   display: inline-block;
   margin-inline: 1px;

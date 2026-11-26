@@ -1,4 +1,4 @@
-"""Read the built-in camera and send eye features as newline-delimited JSON."""
+"""Read the built-in camera and send eye and head features as newline-delimited JSON."""
 
 import argparse
 import json
@@ -52,23 +52,28 @@ def eye_features(landmarks, indexes, width, height):
 
 
 def extract(result, width, height):
-    if not result.face_landmarks:
-        return "searching", None
+    if not result.face_landmarks or not result.facial_transformation_matrixes:
+        return "searching", None, None
+
+    rotation = result.facial_transformation_matrixes[0]
+    angles = rotation[0, 2], rotation[2, 2], rotation[1, 2], rotation[1, 0], rotation[1, 1]
+    if not all(math.isfinite(value) for value in angles):
+        return "searching", None, None
+    yaw = math.atan2(rotation[0, 2], rotation[2, 2])
+    pitch = math.atan2(-rotation[1, 2], math.hypot(rotation[1, 0], rotation[1, 1]))
+    pose = [yaw, pitch]
 
     face = result.face_landmarks[0]
     eyes = [eye_features(face, indexes, width, height) for indexes in EYES]
     if any(eye is None for eye in eyes):
-        return "searching", None
+        return "searching", None, pose
     if min(eye[2] for eye in eyes) < 0.1:
-        return "eyes_closed", None
+        return "eyes_closed", None, pose
 
-    rotation = result.facial_transformation_matrixes[0]
-    yaw = math.atan2(rotation[0, 2], rotation[2, 2])
-    pitch = math.atan2(-rotation[1, 2], math.hypot(rotation[1, 0], rotation[1, 1]))
-    features = [(eyes[0][i] + eyes[1][i]) / 2 for i in range(2)] + [yaw, pitch]
+    features = [(eyes[0][i] + eyes[1][i]) / 2 for i in range(2)] + pose
     if not all(math.isfinite(value) for value in features):
-        return "searching", None
-    return "tracked", features
+        return "searching", None, pose
+    return "tracked", features, pose
 
 
 def run_camera(landmarker):
@@ -97,8 +102,8 @@ def run_camera(landmarker):
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 result = landmarker.detect_for_video(image, int(started_at * 1_000))
-                quality, features = extract(result, width, height)
-                send("sample", timestamp=timestamp, quality=quality, features=features)
+                quality, features, pose = extract(result, width, height)
+                send("sample", timestamp=timestamp, quality=quality, features=features, pose=pose)
             time.sleep(max(0, 1 / FPS - (time.monotonic() - started_at)))
     finally:
         camera.release()

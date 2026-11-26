@@ -1,6 +1,7 @@
 use crate::calibration::Point;
 use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
+use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -30,17 +31,36 @@ impl Screen {
     pub fn move_pointer(self, point: Point) -> Result<(), ()> {
         let [x, y] = point;
         let position = CGPoint::new(x * (self.width - 1.0), y * (self.height - 1.0));
-        let event = CGEvent::new_mouse_event(
-            core_graphics::event_source::CGEventSource::new(
-                core_graphics::event_source::CGEventSourceStateID::CombinedSessionState,
-            )?,
-            CGEventType::MouseMoved,
-            position,
-            CGMouseButton::Left,
-        )?;
-        event.post(CGEventTapLocation::HID);
-        Ok(())
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)?;
+        post_pointer_move(source, position)
     }
+
+    pub fn move_pointer_by(self, offset: Point) -> Result<bool, ()> {
+        let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState)?;
+        let position = CGEvent::new(source.clone())?.location();
+        if !(0.0..self.width).contains(&position.x) || !(0.0..self.height).contains(&position.y) {
+            return Ok(false);
+        }
+        let target = CGPoint::new(
+            (position.x + offset[0]).clamp(0.0, self.width - 1.0),
+            (position.y + offset[1]).clamp(0.0, self.height - 1.0),
+        );
+        if target.x != position.x || target.y != position.y {
+            post_pointer_move(source, target)?;
+        }
+        Ok(true)
+    }
+}
+
+fn post_pointer_move(source: CGEventSource, position: CGPoint) -> Result<(), ()> {
+    let event = CGEvent::new_mouse_event(
+        source,
+        CGEventType::MouseMoved,
+        position,
+        CGMouseButton::Left,
+    )?;
+    event.post(CGEventTapLocation::HID);
+    Ok(())
 }
 
 pub fn can_move_pointer() -> bool {

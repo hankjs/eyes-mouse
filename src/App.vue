@@ -4,12 +4,14 @@ import { Channel, invoke } from '@tauri-apps/api/core'
 
 type Point = [number, number]
 type Mode = 'calibrate' | 'verify'
+type ControlMode = 'eye' | 'head'
 type Camera = 'off' | 'starting' | 'running' | 'error'
 type Quality = 'searching' | 'eyes_closed' | 'tracked' | 'stale'
 
 interface Snapshot {
   camera: Camera
   quality: Quality
+  controlMode: ControlMode
   calibrated: boolean
   pointerEnabled: boolean
   pauseAvailable: boolean
@@ -27,6 +29,7 @@ interface Step {
 const state = ref<Snapshot>({
   camera: 'off',
   quality: 'searching',
+  controlMode: 'eye',
   calibrated: false,
   pointerEnabled: false,
   pauseAvailable: true,
@@ -37,6 +40,7 @@ const state = ref<Snapshot>({
 const connected = ref(false)
 const pending = ref(false)
 const sampling = ref(false)
+const capturingNeutral = ref(false)
 const message = ref('')
 const step = ref<Step | null>(null)
 const mode = ref<Mode>('calibrate')
@@ -45,6 +49,7 @@ let exerciseSequence = 0
 let activateAfterClose = ""
 
 const tracked = computed(() => state.value.camera === 'running' && state.value.quality === 'tracked')
+const headControl = computed(() => state.value.controlMode === 'head')
 const isStarting = computed(() => state.value.camera === 'starting')
 const cameraActive = computed(() => state.value.camera === 'running' || isStarting.value)
 const notice = computed(() => message.value || state.value.message)
@@ -53,11 +58,19 @@ const status = computed(() => {
   if (state.value.camera === 'error') return '相机需要检查'
   if (!cameraActive.value) return '相机已关闭'
   switch (state.value.quality) {
-    case 'tracked': return '正在跟踪双眼'
+    case 'tracked': return headControl.value ? '正在跟踪头部' : '正在跟踪双眼'
     case 'eyes_closed': return '请睁开双眼'
     case 'stale': return '等待相机画面'
-    default: return '未检测到双眼'
+    default: return headControl.value ? '未检测到脸部' : '未检测到双眼'
   }
+})
+const headPreview = computed(() => {
+  if (capturingNeutral.value) return '正在采样，请保持正面'
+  const point = state.value.point
+  if (!point) return state.value.calibrated ? '等待有效的头动数据' : '设定正面位置后显示移动方向'
+  const [x, y] = point
+  const direction = (x < 0.5 ? '左' : x > 0.5 ? '右' : '') + (y < 0.5 ? '上' : y > 0.5 ? '下' : '')
+  return direction ? `向${direction}移动` : '已回正，指针静止'
 })
 
 function coordinates([x, y]: Point) {
@@ -70,16 +83,34 @@ function errorText(error: unknown) {
   return '操作暂时无法完成，请重试。'
 }
 
-async function action(command: string) {
-  if (pending.value) return
+async function action(command: string, args?: Record<string, unknown>) {
+  if (pending.value) return false
   pending.value = true
   message.value = ''
   try {
-    await invoke(command)
+    await invoke(command, args)
+    return true
   } catch (error) {
     message.value = errorText(error)
+    return false
   } finally {
     pending.value = false
+  }
+}
+
+async function changeControlMode(event: Event) {
+  const select = event.currentTarget as HTMLSelectElement
+  const controlMode = select.value as ControlMode
+  if (!await action('set_control_mode', { controlMode })) select.value = state.value.controlMode
+}
+
+async function captureNeutral() {
+  if (pending.value) return
+  capturingNeutral.value = true
+  try {
+    await action('capture_neutral')
+  } finally {
+    capturingNeutral.value = false
   }
 }
 
@@ -198,14 +229,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
     <main>
       <header class="intro">
-        <h1>用视线移动指针</h1>
-        <p>开启相机并校准视线，在接管指针前确认定位效果。</p>
+        <h1>{{ headControl ? '用头部动作移动指针' : '用视线移动指针' }}</h1>
+        <p>{{ headControl ? '开启相机并设定正面位置，先预览头部动作对应的移动方向。' : '开启相机并校准视线，在接管指针前确认定位效果。' }}</p>
       </header>
 
       <div class="workspace">
         <section class="preview" aria-labelledby="preview-title">
           <header class="preview-header">
-            <h2 id="preview-title">注视点预览</h2>
+            <h2 id="preview-title">{{ headControl ? '头动方向预览' : '注视点预览' }}</h2>
             <span v-if="state.pointerEnabled" class="live-label"><i aria-hidden="true"></i>指针已启用</span>
             <span v-else class="preview-mode">指针暂停</span>
           </header>
@@ -221,13 +252,24 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <span v-else class="idle-cross"></span>
           </div>
           <footer class="preview-footer">
-            <span v-if="state.point"><i class="legend-dot" aria-hidden="true"></i>预测注视位置</span>
-            <span v-else>{{ state.calibrated ? '等待有效的眼动数据' : '完成校准后显示预测位置' }}</span>
-            <span v-if="state.point" class="numbers">{{ Math.round(state.point[0] * 100) }}% / {{ Math.round(state.point[1] * 100) }}%</span>
+            <span v-if="headControl"><i v-if="state.point" class="legend-dot" aria-hidden="true"></i>{{ headPreview }}</span>
+            <template v-else>
+              <span v-if="state.point"><i class="legend-dot" aria-hidden="true"></i>预测注视位置</span>
+              <span v-else>{{ state.calibrated ? '等待有效的眼动数据' : '完成校准后显示预测位置' }}</span>
+              <span v-if="state.point" class="numbers">{{ Math.round(state.point[0] * 100) }}% / {{ Math.round(state.point[1] * 100) }}%</span>
+            </template>
           </footer>
         </section>
 
-        <section class="controls" aria-label="眼动控制">
+        <section class="controls" aria-label="指针控制设置">
+          <div class="control-row">
+            <h2><label for="control-mode">控制动作</label></h2>
+            <select id="control-mode" class="button control-select" :value="state.controlMode" :disabled="!connected || pending" @change="changeControlMode">
+              <option value="eye">眼动（注视）</option>
+              <option value="head">头动（转头与点头）</option>
+            </select>
+          </div>
+
           <div class="control-row">
             <div>
               <h2>摄像头</h2>
@@ -237,7 +279,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <button v-else type="button" class="button" :class="{ accent: !state.calibrated }" :disabled="!connected || pending" @click="action('start_camera')">开启相机</button>
           </div>
 
-          <div class="control-row">
+          <div v-if="headControl" class="control-row">
+            <div>
+              <h2>正面位置 <span v-if="state.calibrated" class="done">已设定</span></h2>
+              <p>面向屏幕，保持稳定直到采样完成。转头、抬头或低头控制方向，回正即停。</p>
+            </div>
+            <button type="button" class="button" :class="{ accent: tracked && !state.calibrated }" :disabled="!tracked || pending" @click="captureNeutral">
+              {{ capturingNeutral ? '正在采样…' : state.calibrated ? '重新设定正面位置' : '设定正面位置' }}
+            </button>
+          </div>
+
+          <div v-else class="control-row">
             <div>
               <h2>屏幕校准 <span v-if="state.calibrated" class="done">已完成</span></h2>
               <p>逐个注视目标并按空格。移动相机或调整坐姿后可重新校准。</p>
