@@ -12,6 +12,7 @@ interface Snapshot {
   camera: Camera
   quality: Quality
   controlMode: ControlMode
+  eyeDamping: number
   calibrated: boolean
   pointerEnabled: boolean
   pauseAvailable: boolean
@@ -35,6 +36,7 @@ const state = ref<Snapshot>({
   camera: 'off',
   quality: 'searching',
   controlMode: 'eye',
+  eyeDamping: 50,
   calibrated: false,
   pointerEnabled: false,
   pauseAvailable: true,
@@ -47,6 +49,9 @@ const connected = ref(false)
 const pending = ref(false)
 const sampling = ref(false)
 const capturingNeutral = ref(false)
+const eyeDampingDraft = ref<number | null>(null)
+const savedEyeDamping = ref<number | null>(null)
+const eyeDampingError = ref('')
 const message = ref('')
 const step = ref<Step | null>(null)
 const mode = ref<Mode>('calibrate')
@@ -54,9 +59,12 @@ const exercise = ref<HTMLElement | null>(null)
 let exerciseSequence = 0
 let activateAfterClose = ""
 let resetFocus = ""
+let savingEyeDamping = false
 
 const tracked = computed(() => state.value.camera === 'running' && state.value.quality === 'tracked')
 const headControl = computed(() => state.value.controlMode === 'head')
+// A snapshot may arrive after the slider's newer save confirmation.
+const eyeDamping = computed(() => eyeDampingDraft.value ?? savedEyeDamping.value ?? state.value.eyeDamping)
 const resetStep = computed(() => state.value.resetExercise)
 const activeStep = computed(() => resetStep.value ?? step.value)
 const resetLocation = computed(() => ['中央', '左上', '右下'][(resetStep.value?.index ?? 1) - 1])
@@ -112,6 +120,24 @@ async function changeControlMode(event: Event) {
   const select = event.currentTarget as HTMLSelectElement
   const controlMode = select.value as ControlMode
   if (!await action('set_control_mode', { controlMode })) select.value = state.value.controlMode
+}
+
+async function changeEyeDamping(event: Event) {
+  eyeDampingDraft.value = (event.currentTarget as HTMLInputElement).valueAsNumber
+  eyeDampingError.value = ''
+  if (savingEyeDamping) return
+  savingEyeDamping = true
+  // Keep one native write in flight and apply the latest input as soon as it finishes.
+  while (eyeDampingDraft.value !== null) {
+    const requested: number = eyeDampingDraft.value
+    try {
+      savedEyeDamping.value = await invoke<number>('set_eye_damping', { eyeDamping: requested })
+    } catch (error) {
+      if (eyeDampingDraft.value === requested) eyeDampingError.value = errorText(error)
+    }
+    if (eyeDampingDraft.value === requested) eyeDampingDraft.value = null
+  }
+  savingEyeDamping = false
 }
 
 async function captureNeutral() {
@@ -340,6 +366,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <p v-if="state.validation" class="results" role="status">
               五点验证误差 · 中位数 {{ state.validation.medianPoints }} pt · P90 {{ state.validation.p90Points }} pt
             </p>
+          </div>
+
+          <div v-if="!headControl" class="control-row damping-control">
+            <div class="damping-heading">
+              <h2><label for="eye-damping">眼动阻尼</label></h2>
+              <span class="numbers" aria-hidden="true">{{ eyeDamping }}</span>
+            </div>
+            <input id="eye-damping" class="damping-slider" type="range" min="0" max="100" step="1"
+              :value="eyeDamping" :disabled="!connected || pending" aria-describedby="eye-damping-hint" @input="changeEyeDamping">
+            <p id="eye-damping-hint">数值越低，跟随越快；数值越高，移动越稳。</p>
+            <p v-if="eyeDampingError" class="damping-error" role="status">{{ eyeDampingError }}</p>
           </div>
 
           <div class="control-row">

@@ -26,6 +26,8 @@ const HEAD_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 const HEAD_CAPTURE_SAMPLES: usize = 8;
 const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const RESET_SETTLE: Duration = Duration::from_millis(500);
+const EYE_DAMPING_FILE: &str = "eye-damping.json";
+const CONTROL_MODE_FILE: &str = "control-mode.json";
 
 type HeadPose = [f64; 2];
 
@@ -37,8 +39,56 @@ enum ControlMode {
     Head,
 }
 
-fn control_mode_path(app: &AppHandle) -> Result<PathBuf, tauri::Error> {
-    Ok(app.path().app_config_dir()?.join("control-mode.json"))
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "u8")]
+struct EyeDamping(u8);
+
+impl Default for EyeDamping {
+    fn default() -> Self {
+        Self(50)
+    }
+}
+
+impl TryFrom<u8> for EyeDamping {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if value > 100 {
+            return Err("眼动阻尼必须在 0 到 100 之间。");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl EyeDamping {
+    fn load(path: &Path) -> Self {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn weight(self, distance: f64) -> f64 {
+        let weight = (0.12 + 3.0 * distance).min(0.68);
+        // Scale the adaptive weight from 1.4× at minimum damping to 0.6× at maximum damping.
+        let adjustment = f64::from(Self::default().0) - f64::from(self.0);
+        weight * (1.0 + adjustment / 125.0)
+    }
+}
+
+fn preference_path(app: &AppHandle, name: &str) -> Result<PathBuf, tauri::Error> {
+    Ok(app.path().app_config_dir()?.join(name))
+}
+
+fn write_preference(path: &Path, value: impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes = serde_json::to_vec(&value)?;
+    fs::create_dir_all(path.parent().ok_or("无法读取设置目录")?)?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    if let Err(error) = fs::write(&temporary, bytes).and_then(|_| fs::rename(&temporary, path)) {
+        let _ = fs::remove_file(temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn head_velocity([yaw, pitch]: HeadPose, [neutral_yaw, neutral_pitch]: HeadPose) -> Point {
@@ -97,6 +147,7 @@ struct Snapshot {
     camera: Camera,
     quality: Quality,
     control_mode: ControlMode,
+    eye_damping: EyeDamping,
     calibrated: bool,
     pointer_enabled: bool,
     pause_available: bool,
@@ -230,6 +281,7 @@ struct Runtime {
     camera: Camera,
     quality: Quality,
     control_mode: ControlMode,
+    eye_damping: EyeDamping,
     child: Option<Child>,
     generation: u64,
     camera_started: Option<Instant>,
@@ -271,6 +323,7 @@ impl Runtime {
             camera: self.camera,
             quality: self.quality,
             control_mode: self.control_mode,
+            eye_damping: self.eye_damping,
             calibrated: self.calibrated(),
             pointer_enabled: self.pointer_enabled,
             pause_available: self.pause_available,
@@ -298,6 +351,19 @@ impl Runtime {
             ControlMode::Eye => self.mapping.is_some(),
             ControlMode::Head => self.neutral.is_some(),
         }
+    }
+
+    fn set_eye_damping(
+        &mut self,
+        path: &Path,
+        eye_damping: EyeDamping,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.eye_damping != eye_damping {
+            write_preference(path, eye_damping)?;
+            self.eye_damping = eye_damping;
+            self.publish();
+        }
+        Ok(())
     }
 
     fn disarm(&mut self) {
@@ -663,7 +729,7 @@ impl Runtime {
             .map(|position| position.clamp(0.0, 1.0));
         if let Some(last) = self.point {
             let distance = (point[0] - last[0]).hypot(point[1] - last[1]);
-            let weight = (0.12 + 3.0 * distance).min(0.68);
+            let weight = self.eye_damping.weight(distance);
             for axis in 0..2 {
                 point[axis] = last[axis] + (point[axis] - last[axis]) * weight;
             }
@@ -845,23 +911,29 @@ fn set_control_mode(
     runtime.clear_tracking(Quality::Searching);
     runtime.neutral = None;
     runtime.message = None;
-    let save = || -> Result<(), Box<dyn std::error::Error>> {
-        let path = control_mode_path(&app)?;
-        fs::create_dir_all(path.parent().ok_or("无法读取设置目录")?)?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        fs::write(&temporary, serde_json::to_vec(&control_mode)?)?;
-        if let Err(error) = fs::rename(&temporary, path) {
-            let _ = fs::remove_file(temporary);
-            return Err(error.into());
-        }
-        Ok(())
-    };
-    let result = save().map_err(|error| format!("无法保存控制动作。{error}"));
+    let result = preference_path(&app, CONTROL_MODE_FILE)
+        .map_err(Into::into)
+        .and_then(|path| write_preference(&path, control_mode))
+        .map_err(|error| format!("无法保存控制动作。{error}"));
     if result.is_ok() {
         runtime.control_mode = control_mode;
     }
     runtime.publish();
     result
+}
+
+#[tauri::command]
+fn set_eye_damping(
+    app: AppHandle,
+    state: State<'_, Shared>,
+    eye_damping: EyeDamping,
+) -> Result<EyeDamping, String> {
+    let mut runtime = lock(&state);
+    preference_path(&app, EYE_DAMPING_FILE)
+        .map_err(Into::into)
+        .and_then(|path| runtime.set_eye_damping(&path, eye_damping))
+        .map_err(|error| format!("无法保存眼动阻尼。{error}"))?;
+    Ok(runtime.eye_damping)
 }
 
 fn tracker_command() -> Result<Command, String> {
@@ -1325,11 +1397,14 @@ pub fn run() {
             let state = app.state::<Shared>();
             let mut runtime = lock(&state);
             runtime.pause_available = registered;
-            runtime.control_mode = control_mode_path(app.handle())
+            runtime.control_mode = preference_path(app.handle(), CONTROL_MODE_FILE)
                 .ok()
                 .and_then(|path| fs::read(path).ok())
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
+            if let Ok(path) = preference_path(app.handle(), EYE_DAMPING_FILE) {
+                runtime.eye_damping = EyeDamping::load(&path);
+            }
             drop(runtime);
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
@@ -1342,6 +1417,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             subscribe,
             set_control_mode,
+            set_eye_damping,
             start_camera,
             stop_camera,
             pause_pointer,
@@ -1383,6 +1459,53 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eye_damping_keeps_the_default_response_and_bounds_every_setting() {
+        for distance in [0.0, 0.04, 0.18, 0.5, 2.0_f64.sqrt()] {
+            assert_eq!(
+                EyeDamping::default().weight(distance),
+                (0.12 + 3.0 * distance).min(0.68)
+            );
+            let mut previous = 1.0;
+            for value in 0..=100 {
+                let weight = EyeDamping::try_from(value).unwrap().weight(distance);
+                assert!(weight > 0.0 && weight < previous);
+                previous = weight;
+            }
+        }
+    }
+
+    #[test]
+    fn eye_damping_loads_saved_values_and_survives_invalid_files_and_failed_writes() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("eyes-mouse-{}-{timestamp}", std::process::id()));
+        let path = directory.join(EYE_DAMPING_FILE);
+        let mut runtime = Runtime::default();
+        assert_eq!(EyeDamping::load(&path), runtime.eye_damping);
+
+        let saved = EyeDamping::try_from(80).unwrap();
+        runtime.set_eye_damping(&path, saved).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "80");
+        assert_eq!(EyeDamping::load(&path), saved);
+
+        fs::create_dir(path.with_extension(format!("{}.tmp", std::process::id()))).unwrap();
+        assert!(runtime
+            .set_eye_damping(&path, EyeDamping::try_from(20).unwrap())
+            .is_err());
+        assert_eq!(runtime.eye_damping, saved);
+        assert_eq!(EyeDamping::load(&path), saved);
+
+        for malformed in ["", "{", "101", "-1", "25.5", "\"25\""] {
+            fs::write(&path, malformed).unwrap();
+            assert_eq!(EyeDamping::load(&path), EyeDamping::default());
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn head_velocity_uses_user_directions_from_the_captured_center() {
