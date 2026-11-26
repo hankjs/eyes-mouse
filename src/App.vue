@@ -391,7 +391,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   <div v-else class="shell">
     <header class="topbar">
       <div class="wordmark">
-        <span class="mark" aria-hidden="true"><i></i></span>
+        <img class="mark" src="../src-tauri/icons/icon.png" width="32" height="32" alt="">
         <span>IngridMeow</span>
       </div>
       <div class="topbar-actions">

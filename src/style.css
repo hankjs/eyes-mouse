@@ -40,30 +40,7 @@ p { text-wrap: pretty; }
   font-size: 14px;
 }
 .wordmark { font-weight: 650; letter-spacing: -0.015em; }
-.mark {
-  display: grid;
-  place-items: center;
-  width: 25px;
-  height: 25px;
-  border-radius: 7px;
-  background: var(--plot);
-}
-.mark i {
-  width: 13px;
-  height: 8px;
-  border: 1px solid var(--signal);
-  border-radius: 65% 65%;
-  position: relative;
-}
-.mark i::after {
-  content: "";
-  position: absolute;
-  inset: 1px auto auto 4px;
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: var(--signal);
-}
+.mark { flex: none; }
 .camera-status { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .camera-status i, .live-label i {
   width: 7px;
