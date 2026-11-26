@@ -2,7 +2,7 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import atlas from './ingrid-poses.png'
-import { IDLE_GESTURES, idlePose, movementPose, POSES, type IdleGesture } from './ingrid'
+import { ChaseAnimation, IDLE_GESTURES, idlePose, pickAnimation, POSES, type IdleAccent, type IdleGesture } from './ingrid'
 import { drawLightEffects, type PaintBounds } from './light-effects'
 import type { LightAnchor } from './lights'
 import { DEFAULT_SNAKE_SIZE, SnakeGame, type Facing, type Food } from './snake'
@@ -27,7 +27,8 @@ const LIGHT_FRAME_INTERVAL = 1000 / 30
 const SPRITE_CANVAS_SIZE = 120
 const SPRITE_SCALE = 0.195
 const FEET_OFFSET = 32
-const IDLE_DURATION = 720
+const IDLE_DELAY = 2000
+const IDLE_DURATION = 1200
 const POINTER_GAP = 12
 const MAX_POSE_WIDTH = 68
 const field = ref<HTMLCanvasElement | null>(null)
@@ -55,7 +56,8 @@ let movementFrame = 0
 let previousFrame = 0
 let idleFrame = 0
 let idleTimer: number | undefined
-let nextGesture = 0
+let chase = new ChaseAnimation()
+let lastGesture: IdleGesture | undefined
 let cursor: Cursor | null = null
 let pointerX: number | null = null
 let displayFacing: Facing = 1
@@ -139,6 +141,41 @@ function animateLights(now: number) {
   else previousLightFrame = 0
 }
 
+function drawIdleAccent(ctx: CanvasRenderingContext2D, accent: IdleAccent) {
+  const scale = accent.radius * characterScale
+  ctx.translate(accent.x * characterScale, accent.y * characterScale)
+  ctx.scale(scale, scale)
+  ctx.globalAlpha = accent.opacity
+  ctx.lineWidth = 0.12
+  ctx.beginPath()
+  if (accent.kind === 'heart') {
+    ctx.moveTo(0, 0.84)
+    ctx.bezierCurveTo(-0.20, 0.66, -0.92, 0.12, -0.92, -0.37)
+    ctx.bezierCurveTo(-0.92, -0.88, -0.27, -0.99, 0, -0.55)
+    ctx.bezierCurveTo(0.27, -0.99, 0.92, -0.88, 0.92, -0.37)
+    ctx.bezierCurveTo(0.92, 0.12, 0.20, 0.66, 0, 0.84)
+    ctx.closePath()
+    ctx.fillStyle = '#f394ac'
+    ctx.strokeStyle = '#8e5068'
+    ctx.fill()
+    ctx.stroke()
+    return
+  }
+  ctx.arc(0, 0, 0.9, 0, 2 * Math.PI)
+  ctx.fillStyle = '#efb45d'
+  ctx.strokeStyle = '#9a6232'
+  ctx.fill()
+  ctx.stroke()
+  ctx.fillStyle = '#9a6232'
+  ctx.beginPath()
+  ctx.arc(-0.3, -0.28, 0.15, 0, 2 * Math.PI)
+  ctx.moveTo(0.53, -0.14)
+  ctx.arc(0.4, -0.14, 0.13, 0, 2 * Math.PI)
+  ctx.moveTo(0.14, 0.39)
+  ctx.arc(0, 0.39, 0.14, 0, 2 * Math.PI)
+  ctx.fill()
+}
+
 function drawScene({ seconds = 0, moving = false, gesture, snap = false }: SceneFrame = {}) {
   updateFood()
   const element = character.value
@@ -157,7 +194,8 @@ function drawScene({ seconds = 0, moving = false, gesture, snap = false }: Scene
     displayFacing = preferred >= needed + buffer || preferred >= opposite ? wantedFacing : wantedFacing === 1 ? -1 : 1
   }
   const poseToDraw = gesture ? idlePose(gesture.name, displayFacing, gesture.progress)
-    : movementPose(game.gait, displayFacing, game.gaitTime, reduced)
+    : chase.pose(displayFacing, game.gait, reduced)
+  const { accent } = poseToDraw
   const [sx, sy, sw, sh] = POSES[poseToDraw.sprite]
   const spriteWidth = sw * SPRITE_SCALE * characterScale * (poseToDraw.scaleX ?? 1)
   const spriteHeight = sh * SPRITE_SCALE * characterScale * (poseToDraw.scaleY ?? 1)
@@ -166,10 +204,19 @@ function drawScene({ seconds = 0, moving = false, gesture, snap = false }: Scene
   const tilt = poseToDraw.tilt ?? 0
   const cos = Math.cos(tilt)
   const sin = Math.sin(tilt)
-  const bottom = halfWidth * Math.abs(sin)
-  const top = spriteHeight * cos + bottom
-  const left = halfWidth * cos + Math.max(0, -spriteHeight * sin)
-  const right = halfWidth * cos + Math.max(0, spriteHeight * sin)
+  let bottom = halfWidth * Math.abs(sin)
+  let top = spriteHeight * cos + bottom
+  let left = halfWidth * cos + Math.max(0, -spriteHeight * sin)
+  let right = halfWidth * cos + Math.max(0, spriteHeight * sin)
+  if (accent) {
+    const x = (accent.x * cos - accent.y * sin) * characterScale
+    const y = (accent.x * sin + accent.y * cos) * characterScale
+    const radius = (cos + Math.abs(sin)) * accent.radius * characterScale
+    left = Math.max(left, radius - x)
+    right = Math.max(right, radius + x)
+    top = Math.max(top, radius - y)
+    bottom = Math.max(bottom, radius + y)
+  }
   const lift = (poseToDraw.lift ?? 0) * characterScale
   const desiredOffset = pointerX === null ? 0 : displayFacing === 1 ? -right - POINTER_GAP : left + POINTER_GAP
   if (snap || reduced || Math.abs(desiredOffset - horizontalOffset) < 0.25) horizontalOffset = desiredOffset
@@ -199,6 +246,7 @@ function drawScene({ seconds = 0, moving = false, gesture, snap = false }: Scene
   ctx.translate(middle, middle + feet)
   ctx.rotate(tilt)
   ctx.drawImage(image, sx, sy, sw, sh, -halfWidth, -spriteHeight, spriteWidth, spriteHeight)
+  if (accent) drawIdleAccent(ctx, accent)
   ctx.restore()
 
   const settling = !constrainedOffset && horizontalOffset !== desiredOffset
@@ -234,6 +282,7 @@ function cancelMovement() {
 
 function pause() {
   game?.setTarget(null)
+  chase.stop()
   cancelMovement()
   cancelIdle()
   drawScene({ snap: true })
@@ -241,16 +290,17 @@ function pause() {
 
 function scheduleIdle() {
   if (!game || !polling || movementFrame || reducedMotion?.matches || idleTimer !== undefined || idleFrame) return
-  idleTimer = window.setTimeout(startGesture, 1850 + nextGesture * 430)
+  idleTimer = window.setTimeout(startGesture, IDLE_DELAY)
 }
 
 function startGesture() {
   idleTimer = undefined
   if (!game || !polling || reducedMotion?.matches || document.hidden) return
-  const gesture = IDLE_GESTURES[nextGesture]
+  cancelMovement()
+  const gesture = pickAnimation(IDLE_GESTURES, lastGesture)
+  lastGesture = gesture
   const start = performance.now()
   let previous = start
-  nextGesture = (nextGesture + 1) % IDLE_GESTURES.length
   const animate = (now: number) => {
     idleFrame = 0
     if (!game) return
@@ -279,7 +329,8 @@ function resetGame() {
   pointerX = null
   displayFacing = 1
   horizontalOffset = 0
-  nextGesture = 0
+  chase = new ChaseAnimation()
+  lastGesture = undefined
   game = width && height ? new SnakeGame(width, height, Math.random, window.screen.width || width, foodClock) : null
   drawScene({ snap: true })
   scheduleIdle()
@@ -326,9 +377,10 @@ function animateMovement(now: number) {
   if (!game) return
   const seconds = Math.min(0.05, Math.max(0, (now - previousFrame) / 1000))
   const moving = game.advance(seconds)
+  const airborne = chase.advance(now, seconds, moving, reducedMotion?.matches ?? false)
   previousFrame = now
   const settling = drawScene({ seconds, moving })
-  if (moving || settling) movementFrame = requestAnimationFrame(animateMovement)
+  if (moving || airborne || settling) movementFrame = requestAnimationFrame(animateMovement)
   else scheduleIdle()
 }
 
@@ -343,9 +395,9 @@ function steer(point: Cursor | null) {
   cursor = point
   if (!game) return
   if (point) pointerX = point[0]
-  game.setTarget(point ? { x: point[0], y: point[1] } : null)
-  cancelIdle()
-  startMovement()
+  const moving = game.setTarget(point ? { x: point[0], y: point[1] } : null)
+  if (moving || !point) cancelIdle()
+  if (!idleFrame) startMovement()
 }
 
 async function pollPointer(session: number) {
