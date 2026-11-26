@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { CHARACTER_INSET, HEAD_RADIUS, HOP_DURATION, HOP_LANDING, SnakeGame } from './snake.ts'
-import { BEAD_OUTLINE, BeadTail } from './tail.ts'
+import { LIGHT_TIERS, LightOrbit } from './lights.ts'
 
 function moveTo(game, x, y, frameTime = 1 / 60) {
   game.setTarget({ x, y })
@@ -111,118 +111,6 @@ test('an airborne retarget preserves the current hop and lands within four hops'
   assert.ok([...landings.values()].at(-1) <= 1)
 })
 
-test('bead links lag a sharp turn, swing through, and then settle', () => {
-  const tail = new BeadTail(640, 480)
-  const anchor = { x: 320, y: 240, angle: Math.PI - 0.5, scale: 2 }
-  assert.equal(tail.follow(anchor, 0), false)
-  const angleBeforeTurn = tail.beads.map(({ angle }) => angle)
-  const turn = { ...anchor, x: 310, angle: 0.5 }
-  assert.equal(tail.follow(turn, 1 / 60), true)
-  const [first, second] = tail.beads
-  assert.ok(first.angle > turn.angle + 1, 'the first bead still points toward its previous side')
-  assert.ok(angleBeforeTurn[0] - first.angle > angleBeforeTurn[1] - second.angle, 'the distal bead moves later')
-  let frames = 0
-  let overshot = false
-  while (tail.follow(turn, 1 / 60)) {
-    overshot ||= first.angle < turn.angle - 0.05
-    assert.ok(++frames < 50)
-  }
-  assert.ok(overshot)
-  assert.ok(Math.abs(first.angle - turn.angle) < 0.02)
-  const still = tail.beads.map(({ x, y }) => ({ x, y }))
-  assert.equal(tail.follow(turn, 1), false)
-  assert.deepEqual(tail.beads.map(({ x, y }) => ({ x, y })), still)
-  assert.equal(tail.follow(anchor, 1 / 60, true), false)
-  assert.ok(Math.abs(first.angle - anchor.angle) < 1e-6)
-})
-
-test('an edge-constrained tail keeps its final layout when it stops settling', () => {
-  const tail = new BeadTail(1000, 600)
-  for (let i = 0; i < 6; i++) tail.add({ radius: 10, color: '#ff8a72', x: 0, y: 0 })
-  const anchor = { x: 500, y: 500, angle: Math.atan2(0.55, -1), scale: 2 }
-  tail.follow(anchor, 0)
-  const turn = { ...anchor, angle: Math.atan2(0.55, 1) }
-  for (let i = 0; i < 60; i++) {
-    const before = tail.beads.map(({ x, y }) => ({ x, y }))
-    if (tail.follow(turn, 1 / 60)) continue
-    assert.ok(tail.beads.every((bead, index) => Math.hypot(bead.x - before[index].x, bead.y - before[index].y) < 2))
-    return
-  }
-  assert.fail('tail did not settle')
-})
-
-test('large and newly resized tails keep each link in bounds through all corners', () => {
-  const tail = new BeadTail(320, 240)
-  for (let i = 0; i < 8; i++) tail.add({ radius: 14, color: '#f59ed4', x: 0, y: 0 })
-  const check = (anchor) => {
-    let joint = anchor
-    for (const bead of tail.beads) {
-      const margin = (bead.radius + BEAD_OUTLINE) * anchor.scale - 0.001
-      assert.ok(bead.x >= margin && bead.x <= 320 - margin)
-      assert.ok(bead.y >= margin && bead.y <= 240 - margin)
-      assert.ok(Math.abs(Math.hypot(bead.x - joint.x, bead.y - joint.y) - bead.length * anchor.scale) < 1e-6)
-      joint = bead
-    }
-  }
-  for (const [x, y, angle] of [[8, 10, -2.5], [312, 10, -0.5], [312, 232, 0.5], [8, 232, 2.5]]) {
-    const anchor = { x, y, angle, scale: 3 }
-    for (let i = 0; i < 20; i++) {
-      tail.follow(anchor, 1)
-      check(anchor)
-    }
-  }
-  const resized = { x: 8, y: 232, angle: 2.5, scale: 1 }
-  assert.equal(tail.follow(resized, 1 / 60), false)
-  assert.equal(tail.beads.length, 10)
-  check(resized)
-})
-
-test('the logical head can cross and reverse across the tail and keep eating in delayed frames', () => {
-  const game = new SnakeGame(1000, 600, () => 0)
-  game.tail.follow({ x: 475, y: 300, angle: 0, scale: 2 }, 0, true)
-  const [first, second] = game.tail.beads
-  assert.ok(Math.abs(first.y - game.head.y) < 1)
-  assert.ok(second.x > game.head.x)
-  moveTo(game, 560, 300, 1)
-  assert.ok(game.head.x > second.x)
-  moveTo(game, 480, 300, 1)
-  assert.ok(game.head.x < first.x)
-  const { x, y } = game.food[0]
-  moveTo(game, x, y, 1)
-  assert.equal(game.score, 1)
-  assert.equal(game.tail.beads.length, 3)
-})
-
-test('each food adds one bead of its color and an exhausted batch is replaced at open spots', () => {
-  const firstBatch = [0, 0, 0.65, 0.5]
-  const game = new SnakeGame(1000, 600, () => firstBatch.shift() ?? 0.999)
-  assert.equal(game.food.length, 1)
-  assert.equal(game.tail.beads.length, 2)
-  const food = game.food[0]
-  game.tail.follow({ x: 600, y: 300, angle: Math.PI, scale: 2 }, 0, true)
-  moveTo(game, food.x, food.y)
-  assert.equal(game.score, 1)
-  assert.equal(game.tail.beads.length, 3)
-  assert.equal(game.tail.beads.at(-1).color, food.color)
-  assert.equal(game.food.length, 3)
-  assert.equal(new Set(game.food.map(({ radius }) => radius)).size, 3)
-  for (const pellet of game.food) {
-    assert.ok(Math.hypot(pellet.x - game.head.x, pellet.y - game.head.y) > pellet.radius + HEAD_RADIUS)
-    assert.equal(game.tail.overlaps(pellet, pellet.radius), false)
-    for (const other of game.food) {
-      if (other !== pellet) {
-        assert.ok(Math.hypot(pellet.x - other.x, pellet.y - other.y) > pellet.radius + other.radius)
-      }
-    }
-  }
-  const next = game.food[0]
-  moveTo(game, next.x, next.y)
-  assert.equal(game.tail.beads.length, 2 + game.score)
-  assert.equal(game.tail.beads.at(-1).color, next.color)
-  assert.ok(game.tail.beads.at(-1).radius > game.tail.beads[2].radius)
-  assert.equal(new SnakeGame(1000, 600, () => 0).tail.beads.length, 2)
-})
-
 test('food generation returns when the field is too small', () => {
   const tiny = new SnakeGame(20, 20, () => 0.999)
   assert.equal(tiny.food.length, 0)
@@ -233,5 +121,274 @@ test('food spawned at the edge stays reachable by the whole-character movement b
   assert.equal(game.food[0].x, CHARACTER_INSET)
   assert.equal(game.food[0].y, CHARACTER_INSET)
   moveTo(game, 0, 0)
+  assert.equal(game.score, 1)
+})
+
+const stopped = { moving: false, reduced: false }
+const moving = { moving: true, reduced: false }
+const anchor = { x: 300, y: 300, scale: 2, radiusX: 60, radiusY: 38 }
+
+function pellet(tier, x = 400, y = 350) {
+  return { x, y, tier, radius: LIGHT_TIERS[tier].radius }
+}
+
+function tiers(orbit) {
+  return orbit.lights.map(({ tier }) => tier)
+}
+
+test('three matching lights merge into the next tier, and three large lights leave a finite seal', () => {
+  const orbit = new LightOrbit(1400, 800)
+  assert.equal(orbit.follow(anchor, 0, stopped), true)
+  assert.deepEqual(tiers(orbit), [0, 0])
+  const small = pellet(0)
+  orbit.add(small)
+  assert.deepEqual(tiers(orbit), [1])
+  const [merge] = orbit.effects
+  assert.equal(merge.kind, 'merge')
+  assert.equal(merge.tier, 1)
+  assert.deepEqual(merge.sources.at(-1), { tier: 0, x: small.x, y: small.y })
+  assert.equal(orbit.lights[0].opacity, 0)
+  orbit.follow(anchor, 0.25, stopped)
+  assert.ok(merge.progress > 0 && merge.progress < 1)
+  assert.ok(orbit.lights[0].opacity > 0 && orbit.lights[0].opacity < 1)
+  orbit.follow(anchor, 0.15, stopped)
+  assert.equal(orbit.lights[0].opacity, 1)
+  assert.equal(orbit.effects.length, 0)
+
+  orbit.add(pellet(1))
+  assert.deepEqual(tiers(orbit), [1, 1])
+  orbit.add(pellet(1))
+  assert.deepEqual(tiers(orbit), [2])
+  assert.equal(orbit.effects[0].tier, 2)
+  assert.deepEqual(orbit.effects[0].sources.map(({ tier }) => tier), [1, 1, 1])
+  orbit.follow(anchor, 0.4, stopped)
+
+  orbit.add(pellet(2))
+  assert.deepEqual(tiers(orbit), [2, 2])
+  orbit.add(pellet(2))
+  assert.deepEqual(tiers(orbit), [])
+  assert.deepEqual(orbit.effects.map(({ kind }) => kind), ['seal'])
+  assert.deepEqual(orbit.effects[0].sources.map(({ tier }) => tier), [2, 2, 2])
+  assert.equal(orbit.follow(anchor, 0.5, stopped), true)
+  assert.equal(orbit.follow(anchor, 0.6, stopped), false)
+  assert.deepEqual(orbit.effects, [])
+})
+
+test('one pickup can trigger both merges and then the seal in sequence', () => {
+  const orbit = new LightOrbit(1400, 800)
+  orbit.follow(anchor, 0, stopped)
+  for (const tier of [1, 2, 1, 2]) orbit.add(pellet(tier))
+  assert.equal(orbit.effects.length, 0)
+  orbit.add(pellet(0))
+  assert.deepEqual(orbit.lights, [])
+  assert.deepEqual(orbit.effects.map(({ kind, tier }) => [kind, tier]), [['merge', 1], ['merge', 2], ['seal', 2]])
+  const active = () => orbit.effects.filter(({ progress }) => progress > 0).map(({ kind, tier }) => [kind, tier])
+  orbit.follow(anchor, 0.2, stopped)
+  assert.deepEqual(active(), [['merge', 1]])
+  orbit.follow(anchor, 0.2, stopped)
+  assert.deepEqual(active(), [['merge', 2]])
+  orbit.follow(anchor, 0.36, stopped)
+  assert.deepEqual(active(), [['seal', 2]])
+  assert.equal(orbit.follow(anchor, 1.1, stopped), false)
+})
+
+test('a later pickup waits for earlier merges and keeps existing lights visible until they gather', () => {
+  const orbit = new LightOrbit(1400, 800)
+  orbit.follow(anchor, 0, stopped)
+  for (const tier of [1, 1, 2, 0]) orbit.add(pellet(tier))
+  orbit.follow(anchor, 0.05, stopped)
+  orbit.add(pellet(2))
+  const active = () => orbit.effects.filter(({ progress }) => progress > 0).map(({ kind, tier }) => [kind, tier])
+  const visible = () => orbit.waitingLights.filter(({ opacity }) => opacity > 0).map(({ tier }) => tier)
+  assert.deepEqual(active(), [['merge', 1]])
+  assert.deepEqual(visible(), [1, 1, 2, 2])
+  orbit.follow(anchor, 0.33, stopped)
+  assert.deepEqual(active(), [['merge', 2]])
+  assert.deepEqual(visible(), [2, 2])
+  orbit.follow(anchor, 0.33, stopped)
+  assert.deepEqual(active(), [['merge', 2]])
+  assert.deepEqual(visible(), [2, 2, 2])
+  orbit.follow(anchor, 0.03, stopped)
+  assert.deepEqual(active(), [['seal', 2]])
+  assert.deepEqual(orbit.waitingLights, [])
+})
+
+test('rapid pickups keep the orbit and transient effects bounded', () => {
+  const orbit = new LightOrbit(1400, 800)
+  orbit.follow(anchor, 0, stopped)
+  const totals = [2, 0, 0]
+  let seals = 0
+  for (let index = 0; index < 1000; index++) {
+    const tier = index < 500 ? 0 : index % 3
+    orbit.add(pellet(tier))
+    totals[tier]++
+    for (let type = 0; type < totals.length; type++) {
+      if (totals[type] < 3) continue
+      totals[type] -= 3
+      if (type < 2) totals[type + 1]++
+      else seals++
+    }
+    assert.ok(orbit.effects.length <= 3)
+    assert.deepEqual([0, 1, 2].map((type) => orbit.lights.filter((light) => light.tier === type).length), totals)
+  }
+  assert.ok(seals > 0)
+})
+
+function pairedOrbits(width, height, start) {
+  const orbits = [new LightOrbit(width, height), new LightOrbit(width, height)]
+  for (const orbit of orbits) {
+    orbit.add(pellet(1))
+    orbit.add(pellet(2))
+    orbit.follow(start, 0, stopped)
+  }
+  return orbits
+}
+
+function distances(orbit, reference) {
+  return orbit.lights.map(({ x, y }, index) => Math.hypot(x - reference.lights[index].x, y - reference.lights[index].y))
+}
+
+test('small lights catch first, heavier lights lag, and trails retract while the stopped orbit keeps turning', () => {
+  const [orbit, reference] = pairedOrbits(3000, 1000, anchor)
+  for (let frame = 1; frame <= 60; frame++) {
+    const next = { ...anchor, x: anchor.x + frame * 5 }
+    orbit.follow(next, 1 / 60, moving)
+    reference.follow(next, 1 / 60, { ...stopped, snap: true })
+  }
+  const atRest = { ...anchor, x: anchor.x + 300 }
+  const lag = distances(orbit, reference)
+  assert.ok(lag[0] > 10 && lag[2] > lag[0] && lag[3] > lag[2])
+  assert.ok(orbit.lights.every(({ trailX, trailY }) => trailX < -10 && Math.abs(trailY) < 1e-6))
+  for (let frame = 0; frame < 20; frame++) {
+    const previous = orbit.lights.map(({ trailX }) => Math.abs(trailX))
+    orbit.follow(atRest, 1 / 60, stopped)
+    reference.follow(atRest, 1 / 60, { ...stopped, snap: true })
+    assert.ok(orbit.lights.every(({ trailX }, index) => Math.abs(trailX) <= previous[index] + 1e-6))
+  }
+  assert.ok(distances(orbit, reference).every((lag) => lag < 1))
+  const trails = orbit.lights.map(({ trailX }) => Math.abs(trailX))
+  assert.ok(trails.every((length) => length < 1))
+  orbit.follow(atRest, 1.5, stopped)
+  reference.follow(atRest, 1.5, { ...stopped, snap: true })
+  assert.ok(distances(orbit, reference).every((lag) => lag < 1e-6))
+  assert.ok(orbit.lights.every(({ trailX, trailY }) => trailX === 0 && trailY === 0))
+  const previous = orbit.lights.map(({ x, y }) => ({ x, y }))
+  assert.equal(orbit.follow(atRest, 0.15, stopped), true)
+  assert.ok(previous.every((point, index) => Math.hypot(orbit.lights[index].x - point.x, orbit.lights[index].y - point.y) > 2))
+})
+
+test('every light joins the same orbit within two seconds after far, irregular retargets', () => {
+  const corners = [[38, 38], [38, 2122], [5082, 38], [5082, 2122]]
+  const positions = corners.map(([x, y]) => ({ ...anchor, x, y }))
+  const [orbit, reference] = pairedOrbits(5120, 2160, positions[0])
+  const jitter = [1 / 30, 1 / 60, 1 / 120, 0.075, 0.012]
+  const parked = { ...stopped, snap: true }
+  for (const point of [...positions.slice(1), positions[0], positions[3]]) {
+    orbit.follow(point, 1 / 30, stopped)
+    reference.follow(point, 1 / 30, parked)
+  }
+  assert.ok(Math.min(...distances(orbit, reference)) > 100)
+  let elapsed = 0
+  for (let frame = 0; elapsed < 1.9; frame++) {
+    const seconds = jitter[frame % jitter.length]
+    elapsed += seconds
+    orbit.follow(positions[3], seconds, stopped)
+    reference.follow(positions[3], seconds, parked)
+  }
+  assert.ok(elapsed <= 2)
+  assert.ok(distances(orbit, reference).every((lag) => lag < 1e-6))
+  assert.ok(orbit.lights.every(({ trailX, trailY }) => trailX === 0 && trailY === 0))
+})
+
+test('orbits and trails stay on screen near corners even at the largest size', () => {
+  const width = 320
+  const height = 240
+  const scale = 3
+  const [orbit] = pairedOrbits(width, height, { ...anchor, scale })
+  for (const [x, y] of [[8, 10], [312, 10], [312, 230], [8, 230]]) {
+    for (let frame = 0; frame < 70; frame++) {
+      orbit.follow({ x, y, scale, radiusX: 96, radiusY: 65 }, 1 / 30, frame < 10 ? moving : stopped)
+      for (const light of orbit.lights) {
+        const halo = 1.7 * LIGHT_TIERS[light.tier].orbitRadius * scale
+        assert.ok(light.x >= halo && light.x <= width - halo)
+        assert.ok(light.y >= halo && light.y <= height - halo)
+        assert.ok(light.x + light.trailX >= 0 && light.x + light.trailX <= width)
+        assert.ok(light.y + light.trailY >= 0 && light.y + light.trailY <= height)
+      }
+    }
+  }
+})
+
+test('reduced motion follows instantly, freezes the orbit, and shows a finite static seal', () => {
+  const orbit = new LightOrbit(400, 280)
+  const reduced = { moving: false, reduced: true }
+  assert.equal(orbit.follow(anchor, 0, reduced), false)
+  const next = { ...anchor, x: 200, y: 140 }
+  assert.equal(orbit.follow(next, 0, { ...reduced, moving: true }), false)
+  const parked = orbit.lights.map(({ x, y }) => ({ x, y }))
+  assert.equal(orbit.follow(next, 1, reduced), false)
+  assert.deepEqual(orbit.lights.map(({ x, y }) => ({ x, y })), parked)
+  orbit.add(pellet(0))
+  assert.deepEqual(tiers(orbit), [1])
+  assert.equal(orbit.lights[0].opacity, 1)
+  assert.equal(orbit.effects.length, 0)
+  for (let count = 0; count < 3; count++) orbit.add(pellet(2))
+  assert.equal(orbit.follow(next, 0.4, reduced), true)
+  const [seal] = orbit.effects
+  assert.equal(seal.kind, 'seal')
+  assert.equal(orbit.follow({ ...next, x: 30, y: 30 }, 0.4, reduced), true)
+  assert.deepEqual({ x: seal.x, y: seal.y }, { x: next.x, y: next.y })
+  assert.equal(orbit.follow(next, 0.4, reduced), false)
+})
+
+test('a delayed frame collects a pellet swept between its start and end positions', () => {
+  const game = new SnakeGame(10000, 1000, () => 0)
+  const start = game.head.x
+  const food = pellet(1, start + 100, game.head.y)
+  game.food.splice(0, game.food.length, food)
+  game.setTarget({ x: start + 3200, y: game.head.y })
+  assert.equal(game.advance(1), true)
+  assert.ok(game.head.x > food.x + HEAD_RADIUS + food.radius)
+  assert.equal(game.score, 1)
+  assert.deepEqual(tiers(game.orbit), [0, 0, 1])
+  assert.deepEqual({ x: game.orbit.lights[2].x, y: game.orbit.lights[2].y }, { x: food.x, y: food.y })
+})
+
+test('an exhausted batch is replaced with distinct sized food in open spots', () => {
+  const firstBatch = [0, 0, 0.65, 0.5]
+  const game = new SnakeGame(1000, 600, () => firstBatch.shift() ?? 0.999)
+  assert.equal(game.food.length, 1)
+  assert.deepEqual(tiers(game.orbit), [0, 0])
+  const food = game.food[0]
+  game.orbit.follow({ ...anchor, x: 600 }, 0, stopped)
+  moveTo(game, food.x, food.y)
+  assert.equal(game.score, 1)
+  assert.deepEqual(tiers(game.orbit), [1])
+  assert.equal(game.food.length, 3)
+  assert.equal(new Set(game.food.map(({ tier }) => tier)).size, 3)
+  for (const light of game.food) {
+    assert.equal(light.radius, LIGHT_TIERS[light.tier].radius)
+    assert.ok(Math.hypot(light.x - game.head.x, light.y - game.head.y) > light.radius + HEAD_RADIUS)
+    assert.equal(game.orbit.overlaps(light, light.radius), false)
+    for (const other of game.food) {
+      if (other !== light) assert.ok(Math.hypot(light.x - other.x, light.y - other.y) > light.radius + other.radius)
+    }
+  }
+  const next = game.food[0]
+  moveTo(game, next.x, next.y)
+  assert.equal(game.score, 2)
+  assert.deepEqual(tiers(game.orbit), [1, next.tier])
+})
+
+test('food placement retries as the cat moves away from previously blocked spots', () => {
+  const game = new SnakeGame(130, 80, () => 0)
+  assert.equal(game.food.length, 0)
+  moveTo(game, 92, 40)
+  assert.equal(game.food.length, 0)
+  game.setTarget({ x: 38, y: 40 })
+  for (let frame = 0; frame < 60 && game.food.length === 0; frame++) game.advance(1 / 60)
+  assert.equal(game.food.length, 1)
+  assert.equal(game.score, 0)
+  moveTo(game, 38, 40)
   assert.equal(game.score, 1)
 })

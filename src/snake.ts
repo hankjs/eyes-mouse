@@ -1,4 +1,4 @@
-import { BeadTail } from './tail.ts'
+import { LIGHT_TIERS, LightOrbit, type LightTier } from './lights.ts'
 
 export interface Point {
   x: number
@@ -7,7 +7,7 @@ export interface Point {
 
 export interface Food extends Point {
   radius: number
-  color: string
+  tier: LightTier
 }
 
 export type Gait = 'idle' | 'crawl' | 'walk' | 'jump'
@@ -29,11 +29,6 @@ const WARMUP_SHARE = 0.12
 const MAX_STEP = 4
 const STOP_DISTANCE = 1
 const FOOD_GAP = 8
-const FOOD_SIZES = [
-  { radius: 7, color: '#ffc16f' },
-  { radius: 10, color: '#ff8a72' },
-  { radius: 14, color: '#f59ed4' },
-]
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
@@ -52,7 +47,7 @@ function hopProgress(time: number) {
 }
 
 export class SnakeGame {
-  readonly tail: BeadTail
+  readonly orbit: LightOrbit
   readonly food: Food[] = []
   head: Point
   score = 0
@@ -73,7 +68,7 @@ export class SnakeGame {
     private readonly displayWidth = width,
   ) {
     this.head = { x: width / 2, y: height / 2 }
-    this.tail = new BeadTail(width, height)
+    this.orbit = new LightOrbit(width, height)
     this.spawnBatch()
   }
 
@@ -131,7 +126,7 @@ export class SnakeGame {
       const bite = this.food.findIndex((pellet) => within(next, pellet, HEAD_RADIUS + pellet.radius))
       if (bite >= 0) {
         const [pellet] = this.food.splice(bite, 1)
-        this.tail.add(pellet)
+        this.orbit.add(pellet)
         this.score++
       }
       if (!this.food.length && (bite >= 0 || this.distanceTravelled >= this.retryFoodAt)) {
@@ -193,12 +188,13 @@ export class SnakeGame {
   }
 
   private spawnBatch() {
-    const sizes = [...FOOD_SIZES]
-    const count = 1 + Math.floor(this.random() * sizes.length)
-    while (this.food.length < count && sizes.length) {
-      const [size] = sizes.splice(Math.floor(this.random() * sizes.length), 1)
-      const point = this.openSpot(size.radius)
-      if (point) this.food.push({ ...size, ...point })
+    const tiers: LightTier[] = [0, 1, 2]
+    const count = 1 + Math.floor(this.random() * tiers.length)
+    while (this.food.length < count && tiers.length) {
+      const [tier] = tiers.splice(Math.floor(this.random() * tiers.length), 1)
+      const radius = LIGHT_TIERS[tier].radius
+      const point = this.openSpot(radius)
+      if (point) this.food.push({ ...point, radius, tier })
     }
     this.retryFoodAt = this.distanceTravelled + 48
   }
@@ -211,7 +207,7 @@ export class SnakeGame {
     if (width <= 0 || height <= 0) return null
     const open = (point: Point) => {
       if (this.food.some((pellet) => within(point, pellet, clearance + pellet.radius))) return false
-      return !within(point, this.head, clearance + HEAD_RADIUS) && !this.tail.overlaps(point, clearance)
+      return !within(point, this.head, clearance + HEAD_RADIUS) && !this.orbit.overlaps(point, clearance)
     }
     for (let attempt = 0; attempt < 32; attempt++) {
       const point = { x: inset + this.random() * width, y: inset + this.random() * height }

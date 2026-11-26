@@ -2,9 +2,10 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import atlas from './ingrid-poses.png'
-import { IDLE_GESTURES, idlePose, movementPose, POSES, TAIL_ATTACHMENTS, type IdleGesture } from './ingrid'
+import { IDLE_GESTURES, idlePose, movementPose, POSES, type IdleGesture } from './ingrid'
+import { drawLightEffects, type PaintBounds } from './light-effects'
+import type { LightAnchor } from './lights'
 import { DEFAULT_SNAKE_SIZE, SnakeGame, type Facing, type Food } from './snake'
-import { BEAD_OUTLINE } from './tail'
 
 type Cursor = [number, number]
 
@@ -16,13 +17,13 @@ interface PointerSample {
 
 interface SceneFrame {
   seconds?: number
-  velocityX?: number
-  velocityY?: number
+  moving?: boolean
   gesture?: { name: IdleGesture; progress: number }
   snap?: boolean
 }
 
 const POLL_INTERVAL = 1000 / 30
+const LIGHT_FRAME_INTERVAL = 1000 / 30
 const SPRITE_CANVAS_SIZE = 120
 const SPRITE_SCALE = 0.195
 const FEET_OFFSET = 32
@@ -32,9 +33,15 @@ const MAX_POSE_WIDTH = 68
 const field = ref<HTMLCanvasElement | null>(null)
 const character = ref<HTMLCanvasElement | null>(null)
 const food = shallowRef<Food[]>([])
+const animationsPaused = ref(false)
 
 let fieldContext: CanvasRenderingContext2D | null = null
-let tailBounds: [number, number, number, number] | null = null
+let lightBounds: PaintBounds[] = []
+let lightAnchor: LightAnchor | null = null
+let lightMoving = false
+let lightFrame = 0
+let previousLightFrame = 0
+let lightTime = 0
 let characterContext: CanvasRenderingContext2D | null = null
 let image: HTMLImageElement | null = null
 let reducedMotion: MediaQueryList | null = null
@@ -59,55 +66,54 @@ let readingPointer = false
 let pollSession = 0
 let pollTimer: number | undefined
 
-function drawField() {
+function updateFood() {
   const nextFood = game?.food ?? []
   const displayedFood = food.value
   if (nextFood.length !== displayedFood.length || nextFood.some((pellet, index) => pellet !== displayedFood[index])) {
     food.value = nextFood.slice()
   }
-  const ctx = fieldContext
-  if (!ctx) return
-  if (tailBounds) ctx.clearRect(...tailBounds)
-  tailBounds = null
-  if (!game) return
-
-  const { anchor, beads } = game.tail
-  if (anchor) {
-    let left = Infinity
-    let top = Infinity
-    let right = -Infinity
-    let bottom = -Infinity
-    const outline = BEAD_OUTLINE * anchor.scale
-    ctx.lineWidth = 2 * outline
-    ctx.strokeStyle = '#292022'
-    for (const bead of beads) {
-      const radius = bead.radius * anchor.scale
-      const margin = radius + outline + 1
-      left = Math.min(left, bead.x - margin)
-      top = Math.min(top, bead.y - margin)
-      right = Math.max(right, bead.x + margin)
-      bottom = Math.max(bottom, bead.y + margin)
-      ctx.beginPath()
-      ctx.arc(bead.x, bead.y, radius, 0, 2 * Math.PI)
-      ctx.fillStyle = bead.color
-      ctx.fill()
-      ctx.stroke()
-      ctx.beginPath()
-      ctx.arc(bead.x - 0.32 * radius, bead.y - 0.33 * radius, 0.22 * radius, 0, 2 * Math.PI)
-      ctx.fillStyle = '#fff1d9'
-      ctx.fill()
-    }
-    tailBounds = [left, top, right - left, bottom - top]
-  }
 }
 
-function drawScene({ seconds = 0, velocityX = 0, velocityY = 0, gesture, snap = false }: SceneFrame = {}) {
+function paintLights(seconds: number, snap = false) {
+  const ctx = fieldContext
+  if (!ctx || !game || !lightAnchor || animationsPaused.value || document.hidden) return false
+  const reduced = reducedMotion?.matches ?? false
+  const active = game.orbit.follow(lightAnchor, seconds, { moving: lightMoving, reduced, snap })
+  if (!reduced) lightTime += seconds
+  for (const area of lightBounds) ctx.clearRect(...area)
+  lightBounds = drawLightEffects(ctx, game.orbit, lightTime, reduced, Math.min(width, height) * 0.18)
+  return active
+}
+
+function cancelLights() {
+  if (lightFrame) cancelAnimationFrame(lightFrame)
+  lightFrame = 0
+  previousLightFrame = 0
+}
+
+function scheduleLights() {
+  if (lightFrame || !lightAnchor || animationsPaused.value || document.hidden) return
+  if (!previousLightFrame) previousLightFrame = performance.now()
+  lightFrame = requestAnimationFrame(animateLights)
+}
+
+function animateLights(now: number) {
+  lightFrame = 0
+  const elapsed = now - previousLightFrame
+  if (elapsed < LIGHT_FRAME_INTERVAL - 1) {
+    scheduleLights()
+    return
+  }
+  previousLightFrame = now
+  if (paintLights(elapsed / 1000)) scheduleLights()
+  else previousLightFrame = 0
+}
+
+function drawScene({ seconds = 0, moving = false, gesture, snap = false }: SceneFrame = {}) {
+  updateFood()
   const element = character.value
   const ctx = characterContext
-  if (!element || !ctx || !game || !image?.naturalWidth || !characterCanvasSize) {
-    drawField()
-    return false
-  }
+  if (!element || !ctx || !game || !image?.naturalWidth || !characterCanvasSize) return false
 
   const { x, y } = game.head
   const middle = characterCanvasSize / 2
@@ -165,21 +171,23 @@ function drawScene({ seconds = 0, velocityX = 0, velocityY = 0, gesture, snap = 
   ctx.drawImage(image, sx, sy, sw, sh, -halfWidth, -spriteHeight, spriteWidth, spriteHeight)
   ctx.restore()
 
-  const [anchorX, anchorY] = TAIL_ATTACHMENTS[poseToDraw.sprite]
-  const u = (anchorX - sx) / sw
-  const v = (anchorY - sy) / sh
-  const localX = ((poseToDraw.sprite === 'idle' && displayFacing === -1 ? 1 - u : u) - 0.5) * spriteWidth
-  const localY = (v - 1) * spriteHeight
-  const back = Math.atan2(0.55, -displayFacing) + tilt
-  const angle = reduced ? back : Math.atan2(Math.sin(back) * 145 - velocityY * 0.48, Math.cos(back) * 145 - velocityX * 0.34)
-  const movingTail = game.tail.follow({
-    x: drawX + localX * cos - localY * sin,
-    y: feetY + localX * sin + localY * cos,
-    angle,
+  const settling = !constrainedOffset && horizontalOffset !== desiredOffset
+  const bodyHeight = 0.42 * spriteHeight
+  lightAnchor = {
+    x: drawX + bodyHeight * sin,
+    y: feetY - bodyHeight * cos,
     scale: characterScale,
-  }, seconds, snap || reduced)
-  drawField()
-  return movingTail || (!constrainedOffset && horizontalOffset !== desiredOffset)
+    radiusX: Math.max(26 * characterScale, 0.43 * spriteWidth),
+    radiusY: Math.max(16 * characterScale, 0.29 * spriteHeight),
+  }
+  lightMoving = moving || settling
+  if (snap) {
+    cancelLights()
+    if (paintLights(0, true)) scheduleLights()
+  } else {
+    scheduleLights()
+  }
+  return settling
 }
 
 function cancelIdle() {
@@ -233,6 +241,9 @@ function startGesture() {
 function resetGame() {
   cancelMovement()
   cancelIdle()
+  cancelLights()
+  lightAnchor = null
+  lightTime = 0
   cursor = null
   pointerX = null
   displayFacing = 1
@@ -272,7 +283,7 @@ function sizeCanvases() {
   const scale = Math.min(window.devicePixelRatio, 2)
   fieldElement.width = Math.ceil(width * scale)
   fieldElement.height = Math.ceil(height * scale)
-  tailBounds = null
+  lightBounds = []
   ctx.setTransform(scale, 0, 0, scale, 0, 0)
   sizeCharacterCanvas()
   if (resized) resetGame()
@@ -282,15 +293,10 @@ function sizeCanvases() {
 function animateMovement(now: number) {
   movementFrame = 0
   if (!game) return
-  const head = game.head
   const seconds = Math.min(0.05, Math.max(0, (now - previousFrame) / 1000))
   const moving = game.advance(seconds)
   previousFrame = now
-  const settling = drawScene({
-    seconds,
-    velocityX: seconds ? (game.head.x - head.x) / seconds : 0,
-    velocityY: seconds ? (game.head.y - head.y) / seconds : 0,
-  })
+  const settling = drawScene({ seconds, moving })
   if (moving || settling) movementFrame = requestAnimationFrame(animateMovement)
   else scheduleIdle()
 }
@@ -347,6 +353,8 @@ async function pollPointer(session: number) {
 }
 
 function stopPolling() {
+  animationsPaused.value = true
+  cancelLights()
   polling = false
   pollSession++
   window.clearTimeout(pollTimer)
@@ -355,8 +363,15 @@ function stopPolling() {
 }
 
 function updatePolling() {
-  if (document.hidden) stopPolling()
-  else if (!polling) {
+  if (document.hidden) {
+    stopPolling()
+    return
+  }
+  if (animationsPaused.value) {
+    animationsPaused.value = false
+    if (paintLights(0, true)) scheduleLights()
+  }
+  if (isTauri() && !polling) {
     polling = true
     void pollPointer(++pollSession)
     scheduleIdle()
@@ -380,7 +395,6 @@ onMounted(() => {
   image.src = atlas
   sizeCanvases()
   window.addEventListener('resize', sizeCanvases)
-  if (!isTauri()) return
   document.addEventListener('visibilitychange', updatePolling)
   window.addEventListener('pagehide', stopPolling)
   window.addEventListener('pageshow', updatePolling)
@@ -402,8 +416,9 @@ onUnmounted(() => {
   <canvas ref="field" class="playfield" aria-hidden="true"></canvas>
   <canvas ref="character" class="character" aria-hidden="true"></canvas>
   <!-- Pellets stay visible when their positions overlap the character. -->
-  <span v-for="{ x, y, radius, color } in food" :key="`${x},${y}`" class="pellet" aria-hidden="true"
-    :style="{ left: `${x}px`, top: `${y}px`, '--pellet-diameter': `${2 * radius}px`, backgroundColor: color }"></span>
+  <span v-for="{ x, y, radius, tier } in food" :key="`${x},${y},${tier}`" class="pellet" aria-hidden="true"
+    :class="{ paused: animationsPaused }" :data-tier="tier"
+    :style="{ left: `${x}px`, top: `${y}px`, '--pellet-diameter': `${2 * radius}px` }"></span>
 </template>
 
 <style>
@@ -419,24 +434,49 @@ canvas {
 .playfield {
   width: 100%;
   height: 100%;
+  z-index: 1;
 }
 .pellet {
-  box-sizing: content-box;
+  --twinkle-delay: -0.6s;
+  z-index: 2;
   width: var(--pellet-diameter);
   height: var(--pellet-diameter);
-  border: 2px solid #292022;
   border-radius: 50%;
   translate: -50% -50%;
+  background: radial-gradient(circle, #ffffec 18%, #fff4ab 27%, #ffce43 43%, #e89b14 55%, #b5741d 62%, transparent 69%);
 }
+.pellet[data-tier="1"] {
+  --twinkle-delay: -1.2s;
+}
+.pellet[data-tier="2"] {
+  --twinkle-delay: -1.7s;
+}
+.pellet::before,
 .pellet::after {
   content: '';
   position: absolute;
-  left: 37%;
-  top: 36%;
-  width: 4px;
-  height: 4px;
+  animation: twinkle 1.25s ease-in-out var(--twinkle-delay) infinite alternate;
+}
+.pellet::before {
+  inset: -32%;
   border-radius: 50%;
-  background: #fff1d9;
-  translate: -50% -50%;
+  background: radial-gradient(circle, transparent 35%, #eca32259 47%, #c9721326 58%, transparent 71%);
+}
+.pellet::after {
+  inset: -4% 10%;
+  background: #fff8d6;
+  clip-path: polygon(50% 0, 60% 40%, 100% 50%, 60% 60%, 50% 100%, 40% 60%, 0 50%, 40% 40%);
+}
+.pellet.paused::before,
+.pellet.paused::after {
+  animation-play-state: paused;
+}
+@keyframes twinkle {
+  from { opacity: 0.66; transform: scale(0.87); }
+  to { opacity: 1; transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pellet::before,
+  .pellet::after { animation: none; }
 }
 </style>
