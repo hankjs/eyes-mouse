@@ -18,7 +18,8 @@
         "height": 700,
         "minWidth": 600,
         "minHeight": 490,
-        "center": true
+        "center": true,
+        "visibleOnAllWorkspaces": true
       }
     ],
     "security": {

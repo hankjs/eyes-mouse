@@ -3,6 +3,11 @@
 
 void eyes_mouse_show_snake(void *handle) {
     NSWindow *window = (__bridge NSWindow *)handle;
+    // Keep the same window and webview when the active Space changes.
+    window.collectionBehavior |= NSWindowCollectionBehaviorCanJoinAllSpaces
+        | NSWindowCollectionBehaviorFullScreenAuxiliary
+        | NSWindowCollectionBehaviorCanJoinAllApplications;
+    window.ignoresMouseEvents = YES;
     window.hidesOnDeactivate = NO;
     window.excludedFromWindowsMenu = YES;
     [window orderFrontRegardless];

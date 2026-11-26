@@ -102,7 +102,6 @@ pub fn create(main: &WebviewWindow) -> Result<(WebviewWindow, oneshot::Receiver<
 }
 
 pub fn show(window: &WebviewWindow) -> tauri::Result<()> {
-    window.set_ignore_cursor_events(true)?;
     let handle = window.ns_window()?;
     // Called on the main thread. Tao's show() uses makeKeyAndOrderFront.
     unsafe { eyes_mouse_show_snake(handle) };
