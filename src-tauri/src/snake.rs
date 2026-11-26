@@ -1,8 +1,10 @@
+use serde::Serialize;
+use std::ffi::c_void;
 use std::sync::Mutex;
-use std::time::Duration;
+use tauri::utils::config::BackgroundThrottlingPolicy;
 use tauri::webview::PageLoadEvent;
 use tauri::window::Color;
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 
 pub const LABEL: &str = "snake";
@@ -10,7 +12,28 @@ pub const LABEL: &str = "snake";
 #[derive(Default)]
 pub struct Launch(pub tokio::sync::Mutex<()>);
 
-pub async fn create(main: &WebviewWindow) -> Result<WebviewWindow, String> {
+#[derive(Default)]
+pub enum Status {
+    #[default]
+    Closed,
+    Open {
+        restart: u32,
+    },
+    Closing,
+}
+
+#[derive(Serialize)]
+pub struct PointerSample {
+    pub point: Option<[f64; 2]>,
+    pub restart: u32,
+}
+
+extern "C" {
+    fn eyes_mouse_show_snake(handle: *mut c_void);
+    fn eyes_mouse_snake_pointer(handle: *mut c_void, x: *mut f64, y: *mut f64) -> bool;
+}
+
+pub fn create(main: &WebviewWindow) -> Result<(WebviewWindow, oneshot::Receiver<()>), String> {
     let monitor = main
         .primary_monitor()
         .map_err(|error| error.to_string())?
@@ -31,6 +54,7 @@ pub async fn create(main: &WebviewWindow) -> Result<WebviewWindow, String> {
     .inner_size(size.width, size.height)
     .visible(false)
     .focused(false)
+    .focusable(false)
     .decorations(false)
     .resizable(false)
     .maximizable(false)
@@ -39,6 +63,8 @@ pub async fn create(main: &WebviewWindow) -> Result<WebviewWindow, String> {
     .background_color(Color(0, 0, 0, 0))
     .always_on_top(true)
     .shadow(false)
+    .disable_drag_drop_handler()
+    .background_throttling(BackgroundThrottlingPolicy::Disabled)
     .on_page_load(move |_, page| {
         if page.event() == PageLoadEvent::Finished {
             if let Some(ready) = ready.lock().unwrap().take() {
@@ -49,26 +75,24 @@ pub async fn create(main: &WebviewWindow) -> Result<WebviewWindow, String> {
     .build()
     .map_err(|error| error.to_string())?;
 
-    if !matches!(
-        tokio::time::timeout(Duration::from_secs(5), loaded).await,
-        Ok(Ok(()))
-    ) {
-        let _ = window.destroy();
-        return Err("贪吃蛇加载失败，请重试。".into());
-    }
-    Ok(window)
+    Ok((window, loaded))
 }
 
-pub fn close_for_calibration(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(LABEL) {
-        let _ = window.destroy();
-    }
+pub fn show(window: &WebviewWindow) -> tauri::Result<()> {
+    window.set_ignore_cursor_events(true)?;
+    let handle = window.ns_window()?;
+    // Called on the main thread. Tao's show() uses makeKeyAndOrderFront.
+    unsafe { eyes_mouse_show_snake(handle) };
+    Ok(())
 }
 
-#[tauri::command]
-pub async fn close_snake(window: WebviewWindow) -> Result<(), String> {
-    if window.label() != LABEL {
-        return Err("只能从游戏窗口退出贪吃蛇。".into());
-    }
-    window.close().map_err(|error| error.to_string())
+pub fn pointer_sample(window: &WebviewWindow, restart: u32) -> tauri::Result<PointerSample> {
+    let handle = window.ns_window()?;
+    let (mut x, mut y) = (0.0, 0.0);
+    // Wry dispatches synchronous WKWebView commands on the main thread.
+    let inside = unsafe { eyes_mouse_snake_pointer(handle, &mut x, &mut y) };
+    Ok(PointerSample {
+        point: inside.then_some([x, y]),
+        restart,
+    })
 }

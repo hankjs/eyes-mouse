@@ -20,6 +20,7 @@ interface Snapshot {
   validation: { medianPoints: number; p90Points: number } | null
   message: string | null
   resetExercise: ResetStep | null
+  snakeOpen: boolean
 }
 
 interface Step {
@@ -44,6 +45,7 @@ const state = ref<Snapshot>({
   validation: null,
   message: null,
   resetExercise: null,
+  snakeOpen: false,
 })
 const connected = ref(false)
 const pending = ref(false)
@@ -289,7 +291,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <span class="camera-status" :class="{ live: tracked }" role="status">
           <i aria-hidden="true"></i>{{ status }}
         </span>
-        <button type="button" class="button" :disabled="pending" @click="action('open_snake')">贪吃蛇</button>
+        <template v-if="state.snakeOpen">
+          <button type="button" class="button" :disabled="pending" @click="action('restart_snake')">重新开始</button>
+          <button type="button" class="button" :disabled="pending" @click="action('close_snake')">关闭游戏</button>
+        </template>
+        <button v-else type="button" class="button" :disabled="!connected || pending" @click="action('open_snake')">贪吃蛇</button>
       </div>
     </header>
 

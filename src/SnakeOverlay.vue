@@ -1,14 +1,17 @@
 <script setup lang="ts">
-import { invoke } from '@tauri-apps/api/core'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { onMounted, onUnmounted, ref } from 'vue'
 import { BODY_RADIUS, HEAD_RADIUS, SnakeGame } from './snake'
 
+type Cursor = [number, number]
+
+interface PointerSample {
+  point: Cursor | null
+  restart: number
+}
+
+const POLL_INTERVAL = 1000 / 30
 const canvas = ref<HTMLCanvasElement | null>(null)
-const controls = ref<HTMLElement | null>(null)
-const phase = ref<'ready' | 'playing' | 'ended'>('ready')
-const score = ref(0)
-const notice = ref('')
-const closing = ref(false)
 
 let context: CanvasRenderingContext2D | null = null
 let game: SnakeGame | null = null
@@ -16,6 +19,10 @@ let width = 0
 let height = 0
 let frame = 0
 let previousFrame = 0
+let cursor: Cursor | null = null
+let restart = 0
+let polling = false
+let pollTimer: number | undefined
 
 function disk(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, color: string) {
   ctx.beginPath()
@@ -36,7 +43,7 @@ function draw() {
     disk(ctx, x - radius * 0.26, y - radius * 0.28, 2, '#fff1d9')
   }
 
-  const bodyColor = game.crashed ? '#ffab92' : '#9deac0'
+  const bodyColor = '#9deac0'
   const tail = game.trail[0]
   ctx.beginPath()
   ctx.moveTo(tail.x, tail.y)
@@ -70,170 +77,107 @@ function stopMovement() {
   frame = 0
 }
 
+function resetGame() {
+  stopMovement()
+  cursor = null
+  game = width && height ? new SnakeGame(width, height) : null
+  draw()
+}
+
 function sizeCanvas() {
   const element = canvas.value
   if (!element || !context) return
   const nextWidth = element.clientWidth
   const nextHeight = element.clientHeight
-  if (width !== nextWidth || height !== nextHeight) {
-    stopMovement()
-    width = nextWidth
-    height = nextHeight
-    phase.value = 'ready'
-    game = null
-    score.value = 0
-  }
+  const resized = width !== nextWidth || height !== nextHeight
+  width = nextWidth
+  height = nextHeight
   const scale = Math.min(window.devicePixelRatio, 2)
   element.width = Math.ceil(width * scale)
   element.height = Math.ceil(height * scale)
   context.setTransform(scale, 0, 0, scale, 0, 0)
-  draw()
-}
-
-function start() {
-  if (!controls.value || !width || !height) return
-  stopMovement()
-  notice.value = ''
-  game = new SnakeGame(width, height, controls.value.getBoundingClientRect())
-  phase.value = 'playing'
-  score.value = 0
-  draw()
+  if (resized) resetGame()
+  else draw()
 }
 
 function animate(now: number) {
   frame = 0
-  if (!game || phase.value !== 'playing') return
+  if (!game) return
   const moving = game.advance((now - previousFrame) / 1000)
   previousFrame = now
-  score.value = game.score
   draw()
-  if (game.crashed) {
-    phase.value = 'ended'
-  } else if (moving) {
-    frame = requestAnimationFrame(animate)
-  }
+  if (moving) frame = requestAnimationFrame(animate)
 }
 
-function steer(event: PointerEvent) {
-  if (!game || phase.value !== 'playing') return
-  game.setTarget({ x: event.clientX, y: event.clientY })
+function steer(point: Cursor | null) {
+  if (point?.[0] === cursor?.[0] && point?.[1] === cursor?.[1]) return
+  cursor = point
+  if (!point) {
+    stopMovement()
+    return
+  }
+  if (!game) return
+  game.setTarget({ x: point[0], y: point[1] })
   if (!frame) {
     previousFrame = performance.now()
     frame = requestAnimationFrame(animate)
   }
 }
 
-async function close() {
-  if (closing.value) return
-  closing.value = true
-  stopMovement()
+async function pollPointer() {
+  const started = performance.now()
+  let sample: PointerSample | null = null
   try {
-    await invoke('close_snake')
+    sample = await invoke<PointerSample | null>('snake_pointer')
   } catch {
-    notice.value = '暂时无法关闭游戏，请重试。'
-    closing.value = false
+    // Treat a missed sample as a pointer outside the play area.
   }
+  if (!polling) return
+  if (sample && sample.restart !== restart) {
+    restart = sample.restart
+    resetGame()
+  }
+  steer(sample?.point ?? null)
+  // Wait for each native reply before scheduling another read.
+  const interval = sample ? POLL_INTERVAL : 100
+  pollTimer = window.setTimeout(pollPointer, Math.max(0, Math.ceil(interval - (performance.now() - started))))
 }
 
-function onKeydown(event: KeyboardEvent) {
-  if (event.repeat) return
-  if (event.key === 'Escape') {
-    event.preventDefault()
-    void close()
-  } else if (event.key === 'Enter' && phase.value !== 'playing' && !(event.target instanceof HTMLButtonElement)) {
-    event.preventDefault()
-    start()
-  }
+function stopPolling() {
+  polling = false
+  window.clearTimeout(pollTimer)
+  stopMovement()
 }
 
 onMounted(() => {
   context = canvas.value?.getContext('2d') ?? null
+  if (!context) return
   sizeCanvas()
-  window.addEventListener('keydown', onKeydown)
   window.addEventListener('resize', sizeCanvas)
-  window.addEventListener('blur', stopMovement)
+  if (!isTauri()) return
+  window.addEventListener('pagehide', stopPolling)
+  polling = true
+  void pollPointer()
 })
 
 onUnmounted(() => {
-  stopMovement()
-  window.removeEventListener('keydown', onKeydown)
+  stopPolling()
   window.removeEventListener('resize', sizeCanvas)
-  window.removeEventListener('blur', stopMovement)
+  window.removeEventListener('pagehide', stopPolling)
 })
 </script>
 
 <template>
-  <main>
-    <canvas ref="canvas" aria-hidden="true" @pointerenter="steer" @pointermove="steer" @pointerleave="stopMovement"></canvas>
-    <section ref="controls" class="hud" aria-labelledby="snake-title">
-      <div class="hud-row">
-        <h1 id="snake-title">贪吃蛇</h1>
-        <span v-if="phase !== 'ready'" class="score">食物 {{ score }}</span>
-        <button v-if="phase !== 'playing'" type="button" class="start" @click="start">
-          {{ phase === 'ended' ? '再玩一次' : '开始' }}
-        </button>
-        <button type="button" class="close" :disabled="closing" @click="close">退出 <kbd>Esc</kbd></button>
-      </div>
-      <p v-if="phase === 'ready'">移动指针引导蛇头，吃下食物会变长。</p>
-      <p v-if="phase === 'ended'" role="status">碰到蛇身，游戏结束。</p>
-      <p v-if="notice" role="alert">{{ notice }}</p>
-    </section>
-  </main>
+  <canvas ref="canvas" aria-hidden="true"></canvas>
 </template>
 
 <style>
-:root {
-  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-  font-synthesis: none;
-  color: #fdf7ef;
-  background: transparent;
-}
-
-* { box-sizing: border-box; }
-body { margin: 0; overflow: hidden; background: transparent; }
+html, body { margin: 0; overflow: hidden; background: transparent; }
 canvas {
   position: fixed;
   inset: 0;
   width: 100%;
   height: 100%;
-  /* A clear window region can pass pointer events through on macOS. */
-  background: rgb(0 0 0 / 2%);
+  pointer-events: none;
 }
-
-.hud {
-  position: fixed;
-  inset: 16px auto auto 16px;
-  max-width: calc(100% - 32px);
-  padding: 9px 10px 9px 13px;
-  border: 1px solid #62544c;
-  border-radius: 11px;
-  background: #282322;
-  box-shadow: 0 3px 14px #241e1b40;
-  user-select: none;
-}
-
-.hud-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.hud h1 { margin: 0 4px 0 0; font-size: 14px; font-weight: 650; white-space: nowrap; }
-.hud p { margin: 7px 0 1px; color: #ddd0c4; font-size: 12px; line-height: 1.55; }
-.score { margin-inline-end: 4px; font-size: 12px; font-variant-numeric: tabular-nums; color: #ddd0c4; }
-
-.hud button {
-  min-height: 32px;
-  padding: 5px 9px;
-  border: 1px solid #716059;
-  border-radius: 6px;
-  color: inherit;
-  background: transparent;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.hud button:hover { background: #483c37; }
-.hud button:focus-visible { outline: 2px solid #ffd5ad; outline-offset: 2px; }
-.hud button.start { color: #281d16; background: #ffc999; border-color: #ffc999; font-weight: 650; }
-.hud button.start:hover { background: #ffdab8; }
-.hud button:disabled { opacity: 0.65; cursor: default; }
-kbd { margin-inline-start: 3px; color: #ddd0c4; font: 10px ui-monospace, monospace; }
 </style>

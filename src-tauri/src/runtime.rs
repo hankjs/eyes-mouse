@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
+use tokio::sync::oneshot;
 
 const STREAM_STALE: Duration = Duration::from_millis(350);
 const TRACKING_LOST: Duration = Duration::from_millis(850);
@@ -156,6 +157,7 @@ struct Snapshot {
     validation: Option<Validation>,
     message: Option<String>,
     reset_exercise: Option<ResetStep>,
+    snake_open: bool,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -309,6 +311,7 @@ struct Runtime {
     activation_generation: u64,
     pause_available: bool,
     message: Option<String>,
+    snake: snake::Status,
 }
 
 type Shared = Mutex<Runtime>;
@@ -338,6 +341,7 @@ impl Runtime {
                 .as_ref()
                 .filter(|reset| reset.visible)
                 .and_then(ResetSession::step),
+            snake_open: matches!(self.snake, snake::Status::Open { .. }),
         };
         if let Some(channel) = &self.stream {
             if channel.send(snapshot).is_err() {
@@ -841,7 +845,7 @@ fn open_reset(app: &AppHandle, id: u32) {
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
         monitor(window)?;
-        snake::close_for_calibration(app);
+        destroy_snake(app)?;
         window.set_focus().map_err(|error| error.to_string())?;
         window
             .set_simple_fullscreen(true)
@@ -885,7 +889,15 @@ fn close_reset(app: &AppHandle, id: u32) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn subscribe(app: AppHandle, state: State<'_, Shared>, channel: Channel<Snapshot>) {
+fn subscribe(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+    channel: Channel<Snapshot>,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("请从 Eyes Mouse 主窗口订阅状态。".into());
+    }
     let action = {
         let mut runtime = lock(&state);
         let action = runtime.cancel_reset();
@@ -895,6 +907,7 @@ fn subscribe(app: AppHandle, state: State<'_, Shared>, channel: Channel<Snapshot
         action
     };
     dispatch_main_action(&app, action);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1106,25 +1119,110 @@ async fn open_snake(
     state: State<'_, Shared>,
     launch: State<'_, snake::Launch>,
 ) -> Result<(), String> {
-    if window.label() != "main" {
-        return Err("请从 Eyes Mouse 主窗口打开贪吃蛇。".into());
-    }
+    require_snake_controls(&window)?;
     let _launch = launch.0.lock().await;
     let calibrating = "请结束屏幕校准后再打开贪吃蛇。";
-    if lock(&state).calibration_active() {
-        return Err(calibrating.into());
+    {
+        let runtime = lock(&state);
+        if runtime.calibration_active() {
+            return Err(calibrating.into());
+        }
+        match runtime.snake {
+            snake::Status::Open { .. } => return Ok(()),
+            snake::Status::Closing => return Err("贪吃蛇正在关闭，请重试。".into()),
+            snake::Status::Closed => {}
+        }
     }
-    let overlay = match app.get_webview_window(snake::LABEL) {
-        Some(overlay) => overlay,
-        None => snake::create(&window).await?,
+    let (overlay, loaded) = snake::create(&window)?;
+    let loaded = matches!(
+        tokio::time::timeout(Duration::from_secs(5), loaded).await,
+        Ok(Ok(()))
+    );
+
+    let (reply, shown) = oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let state = handle.state::<Shared>();
+        let result = (|| {
+            {
+                let runtime = lock(&state);
+                if runtime.calibration_active() {
+                    return Err(calibrating.into());
+                }
+                if matches!(runtime.snake, snake::Status::Closing)
+                    || handle.get_webview_window(snake::LABEL).is_none()
+                    || handle.get_webview_window("main").is_none()
+                {
+                    return Err("贪吃蛇已关闭。".into());
+                }
+            }
+            if !loaded {
+                return Err("贪吃蛇加载失败，请重试。".into());
+            }
+            snake::show(&overlay).map_err(|error| error.to_string())?;
+            let mut runtime = lock(&state);
+            runtime.snake = snake::Status::Open { restart: 0 };
+            runtime.publish();
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = destroy_snake(&handle);
+        }
+        let _ = reply.send(result);
+    })
+    .map_err(|error| error.to_string())?;
+    shown.await.map_err(|error| error.to_string())?
+}
+
+fn require_snake_controls(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("请从 Eyes Mouse 主窗口控制贪吃蛇。".into());
+    }
+    Ok(())
+}
+
+fn destroy_snake(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<Shared>();
+    if matches!(lock(&state).snake, snake::Status::Closing) {
+        return Ok(());
+    }
+    if let Some(window) = app.get_webview_window(snake::LABEL) {
+        window.destroy().map_err(|error| error.to_string())?;
+        let _ = window.hide();
+        lock(&state).snake = snake::Status::Closing;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn close_snake(window: WebviewWindow) -> Result<(), String> {
+    require_snake_controls(&window)?;
+    destroy_snake(window.app_handle())
+}
+
+#[tauri::command]
+fn restart_snake(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+    require_snake_controls(&window)?;
+    if let snake::Status::Open { restart } = &mut lock(&state).snake {
+        *restart = restart.wrapping_add(1);
+        return Ok(());
+    }
+    Err("贪吃蛇尚未打开。".into())
+}
+
+#[tauri::command]
+fn snake_pointer(
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+) -> Result<Option<snake::PointerSample>, String> {
+    if window.label() != snake::LABEL {
+        return Err("只能在贪吃蛇窗口读取游戏指针。".into());
+    }
+    let snake::Status::Open { restart } = lock(&state).snake else {
+        return Ok(None);
     };
-    if lock(&state).calibration_active() {
-        let _ = overlay.destroy();
-        return Err(calibrating.into());
-    }
-    overlay
-        .show()
-        .and_then(|()| overlay.set_focus())
+    snake::pointer_sample(&window, restart)
+        .map(Some)
         .map_err(|error| error.to_string())
 }
 
@@ -1215,10 +1313,14 @@ fn begin_exercise(
     runtime.message = None;
     runtime.publish();
     drop(runtime);
-    snake::close_for_calibration(window.app_handle());
-    if let Err(error) = window.set_simple_fullscreen(true) {
+    let fullscreen = destroy_snake(window.app_handle()).and_then(|()| {
+        window
+            .set_simple_fullscreen(true)
+            .map_err(|error| error.to_string())
+    });
+    if let Err(error) = fullscreen {
         lock(&state).session = None;
-        return Err(error.to_string());
+        return Err(error);
     }
     Ok(step)
 }
@@ -1461,13 +1563,32 @@ pub fn run() {
             capture_target,
             reset_target_ready,
             open_snake,
-            snake::close_snake
+            close_snake,
+            restart_snake,
+            snake_pointer
         ])
         .build(tauri::generate_context!())
         .expect("build Eyes Mouse")
         .run(|app, event| match event {
             tauri::RunEvent::Exit => {
                 lock(&app.state::<Shared>()).stop(None);
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == snake::LABEL => {
+                let state = app.state::<Shared>();
+                let mut runtime = lock(&state);
+                runtime.snake = snake::Status::Closed;
+                runtime.publish();
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Destroyed,
+                ..
+            } if label == "main" => {
+                let _ = destroy_snake(app);
             }
             tauri::RunEvent::WindowEvent {
                 label,
