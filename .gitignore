@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.venv/
+src-tauri/target/
+src-tauri/gen/
+src-tauri/binaries/
+tracker/face_landmarker.task
+__pycache__/
+.DS_Store
