@@ -164,6 +164,20 @@ h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.03em; line-height: 1.
 .damping-slider { width: 100%; min-height: 28px; margin: 0; accent-color: var(--accent); }
 .damping-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 .damping-control .damping-error { color: var(--accent); }
+.accessibility-dialog {
+  width: min(400px, calc(100% - 40px));
+  padding: 22px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--canvas);
+  color: var(--ink);
+  box-shadow: 0 12px 40px oklch(0.24 0.013 32 / 0.2);
+}
+.accessibility-dialog::backdrop { background: oklch(0.24 0.013 32 / 0.4); }
+.accessibility-dialog h2 { font-size: 17px; font-weight: 650; }
+.accessibility-dialog p { margin-top: 9px; color: var(--muted); font-size: 13px; line-height: 1.65; }
+.accessibility-dialog .notice { color: var(--accent); }
+.dialog-actions { justify-content: end; margin-top: 17px; }
 kbd {
   display: inline-block;
   margin-inline: 1px;

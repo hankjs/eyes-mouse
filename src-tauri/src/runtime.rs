@@ -126,6 +126,39 @@ enum Quality {
     Stale,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PointerAccess {
+    #[default]
+    Missing,
+    Waiting,
+    Granted,
+    RestartRequired,
+    Restarting,
+}
+
+impl PointerAccess {
+    fn current() -> Self {
+        if macos::can_move_pointer() {
+            Self::Granted
+        } else {
+            Self::without_post_access()
+        }
+    }
+
+    fn without_post_access() -> Self {
+        if macos::accessibility_trusted() {
+            Self::RestartRequired
+        } else {
+            Self::Missing
+        }
+    }
+
+    fn in_progress(self) -> bool {
+        matches!(self, Self::Waiting | Self::Restarting)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Packet {
@@ -152,6 +185,7 @@ struct Snapshot {
     eye_damping: EyeDamping,
     calibrated: bool,
     pointer_enabled: bool,
+    pointer_access: PointerAccess,
     pause_available: bool,
     point: Option<Point>,
     validation: Option<Validation>,
@@ -261,6 +295,7 @@ enum MainAction {
     OpenReset(u32),
     CloseReset(u32),
     Exit(u64),
+    RestartForPointerAccess,
 }
 
 impl Session {
@@ -308,6 +343,8 @@ struct Runtime {
     validation: Option<Validation>,
     point: Option<Point>,
     pointer_enabled: bool,
+    pointer_access: PointerAccess,
+    pointer_access_request: u64,
     activation_generation: u64,
     pause_available: bool,
     message: Option<String>,
@@ -315,8 +352,9 @@ struct Runtime {
 }
 
 type Shared = Mutex<Runtime>;
+type PermissionChecks = Mutex<macos::PermissionChecks>;
 
-fn lock(state: &Shared) -> MutexGuard<'_, Runtime> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state.lock().unwrap_or_else(|error| error.into_inner())
 }
 
@@ -330,6 +368,7 @@ impl Runtime {
             eye_damping: self.eye_damping,
             calibrated: self.calibrated(),
             pointer_enabled: self.pointer_enabled,
+            pointer_access: self.pointer_access,
             pause_available: self.pause_available,
             point: self.point.filter(|_| self.quality == Quality::Tracked),
             validation: self
@@ -356,6 +395,50 @@ impl Runtime {
             ControlMode::Eye => self.mapping.is_some(),
             ControlMode::Head => self.neutral.is_some(),
         }
+    }
+
+    fn request_pointer_access(
+        &mut self,
+        current: impl FnOnce() -> PointerAccess,
+        prompt: impl FnOnce(),
+    ) -> Result<(), String> {
+        if self.exiting || self.pointer_access.in_progress() {
+            return Ok(());
+        }
+        if self.calibration_active() || self.head_capture.is_some() {
+            return Err("请先结束校准或采样。".into());
+        }
+        self.pointer_access = current();
+        if self.pointer_access == PointerAccess::Missing {
+            self.disarm();
+            self.pointer_access = PointerAccess::Waiting;
+            self.pointer_access_request = self.pointer_access_request.wrapping_add(1);
+            self.message = None;
+            prompt();
+        }
+        self.publish();
+        Ok(())
+    }
+
+    fn cancel_pointer_access(&mut self) {
+        if self.pointer_access == PointerAccess::Waiting {
+            self.pointer_access = PointerAccess::Missing;
+            self.publish();
+        }
+    }
+
+    fn pending_pointer_access(&self) -> Option<u64> {
+        (!self.exiting && self.pointer_access == PointerAccess::Waiting)
+            .then_some(self.pointer_access_request)
+    }
+
+    fn observe_pointer_grant(&mut self, request: u64) -> Option<MainAction> {
+        if self.pending_pointer_access() != Some(request) {
+            return None;
+        }
+        self.pointer_access = PointerAccess::Restarting;
+        self.publish();
+        Some(MainAction::RestartForPointerAccess)
     }
 
     fn set_eye_damping(
@@ -604,6 +687,7 @@ impl Runtime {
             && self.control_mode == ControlMode::Eye
             && self.stream.is_some()
             && !self.calibration_active()
+            && !self.pointer_access.in_progress()
             && !self.exiting
     }
 
@@ -641,9 +725,11 @@ impl Runtime {
                     self.message = match check_pointer_ready(self) {
                         Err(message) => Some(message),
                         Ok(()) if !macos::can_move_pointer() => {
-                            Some("请先用「启用指针」授予 macOS 辅助功能权限。".into())
+                            self.pointer_access = PointerAccess::without_post_access();
+                            Some("请先在主窗口完成辅助功能授权。".into())
                         }
                         Ok(()) => {
+                            self.pointer_access = PointerAccess::Granted;
                             self.arm();
                             Some("已用左右眼动手势启用指针。".into())
                         }
@@ -799,7 +885,8 @@ impl Runtime {
 
     fn pointer_access_error(&mut self) {
         self.disarm();
-        self.message = Some("无法移动指针。请检查 macOS「隐私与安全性 → 辅助功能」。".into());
+        self.pointer_access = PointerAccess::current();
+        self.message = Some("无法移动指针。请检查主窗口中的辅助功能权限。".into());
     }
 }
 
@@ -825,7 +912,27 @@ fn dispatch_main_action(app: &AppHandle, action: Option<MainAction>) {
                 // Reap the tracker before requesting exit, including Tauri's direct-exit fallback.
                 runtime.stop(None);
             }
+            lock(&handle.state::<PermissionChecks>()).close();
             handle.exit(0);
+        }
+        MainAction::RestartForPointerAccess => {
+            let unregister_pause = {
+                let state = handle.state::<Shared>();
+                let mut runtime = lock(&state);
+                if runtime.exiting || runtime.pointer_access != PointerAccess::Restarting {
+                    return;
+                }
+                runtime.exiting = true;
+                // Reap the tracker even if Tauri falls back to restarting without an Exit event.
+                runtime.stop(None);
+                runtime.pause_available
+            };
+            if unregister_pause {
+                // LaunchServices can start the new process before this process has exited.
+                let _ = handle.global_shortcut().unregister(pause_shortcut());
+            }
+            lock(&handle.state::<PermissionChecks>()).close();
+            handle.request_restart();
         }
     });
 }
@@ -1057,28 +1164,65 @@ fn pause_pointer(state: State<'_, Shared>) {
 }
 
 #[tauri::command]
-fn enable_pointer(state: State<'_, Shared>) -> Result<(), String> {
-    let activation_generation = {
+fn request_pointer_access(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    lock(&state).request_pointer_access(PointerAccess::current, macos::prompt_accessibility)
+}
+
+#[tauri::command]
+fn cancel_pointer_access(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    lock(&state).cancel_pointer_access();
+    Ok(())
+}
+
+#[tauri::command]
+fn open_accessibility_settings(
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    {
         let runtime = lock(&state);
-        check_pointer_ready(&runtime)?;
-        runtime.activation_generation
-    };
-    if !macos::can_move_pointer() && !macos::request_pointer_access() {
-        return Err(
-            "请在 macOS「隐私与安全性 → 辅助功能」允许 Eyes Mouse，然后重新启用指针。".into(),
+        if runtime.exiting || runtime.pointer_access != PointerAccess::Waiting {
+            return Ok(());
+        }
+    }
+    if macos::open_accessibility_settings() {
+        Ok(())
+    } else {
+        Err("无法打开系统设置。请从苹果菜单打开，再选择「隐私与安全性 → 辅助功能」。".into())
+    }
+}
+
+fn require_pointer_controls(window: &WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("请从 Eyes Mouse 主窗口管理指针。".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn enable_pointer(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
+    require_pointer_controls(&window)?;
+    let mut runtime = lock(&state);
+    check_pointer_ready(&runtime)?;
+    if !macos::can_move_pointer() {
+        return runtime.request_pointer_access(
+            PointerAccess::without_post_access,
+            macos::prompt_accessibility,
         );
     }
-    let mut runtime = lock(&state);
-    if runtime.activation_generation != activation_generation {
-        return Err("启用已取消。请再次选择「启用指针」。".into());
-    }
-    check_pointer_ready(&runtime)?;
+    runtime.pointer_access = PointerAccess::Granted;
     runtime.arm();
     runtime.publish();
     Ok(())
 }
 
 fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
+    if runtime.pointer_access.in_progress() {
+        return Err("请先完成辅助功能授权或取消等待。".into());
+    }
     if runtime.calibration_active()
         || runtime.head_capture.is_some()
         || runtime.exiting
@@ -1513,10 +1657,25 @@ async fn capture_target(
     })
 }
 
+fn pause_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP)
+}
+
+fn cancel_pointer_access_on_exit(app: &AppHandle) {
+    {
+        let state = app.state::<Shared>();
+        let mut runtime = lock(&state);
+        runtime.exiting = true;
+        runtime.cancel_pointer_access();
+    }
+    lock(&app.state::<PermissionChecks>()).close();
+}
+
 pub fn run() {
-    let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
+    let shortcut = pause_shortcut();
     tauri::Builder::default()
         .manage(Shared::default())
+        .manage(PermissionChecks::default())
         .manage(snake::Launch::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
@@ -1532,6 +1691,7 @@ pub fn run() {
             let state = app.state::<Shared>();
             let mut runtime = lock(&state);
             runtime.pause_available = registered;
+            runtime.pointer_access = PointerAccess::current();
             runtime.control_mode = preference_path(app.handle(), CONTROL_MODE_FILE)
                 .ok()
                 .and_then(|path| fs::read(path).ok())
@@ -1544,8 +1704,17 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(Duration::from_millis(220));
-                let action = lock(&handle.state::<Shared>()).watchdog();
+                let (action, request) = {
+                    let state = handle.state::<Shared>();
+                    let mut runtime = lock(&state);
+                    (runtime.watchdog(), runtime.pending_pointer_access())
+                };
                 dispatch_main_action(&handle, action);
+                let grant = lock(&handle.state::<PermissionChecks>()).poll(request);
+                if let Some(request) = grant {
+                    let action = lock(&handle.state::<Shared>()).observe_pointer_grant(request);
+                    dispatch_main_action(&handle, action);
+                }
             });
             Ok(())
         })
@@ -1556,6 +1725,9 @@ pub fn run() {
             start_camera,
             stop_camera,
             pause_pointer,
+            request_pointer_access,
+            cancel_pointer_access,
+            open_accessibility_settings,
             enable_pointer,
             capture_neutral,
             begin_exercise,
@@ -1570,7 +1742,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("build Eyes Mouse")
         .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                cancel_pointer_access_on_exit(app);
+            }
             tauri::RunEvent::Exit => {
+                cancel_pointer_access_on_exit(app);
                 lock(&app.state::<Shared>()).stop(None);
             }
             tauri::RunEvent::WindowEvent {
@@ -1588,7 +1764,26 @@ pub fn run() {
                 event: tauri::WindowEvent::Destroyed,
                 ..
             } if label == "main" => {
+                cancel_pointer_access_on_exit(app);
                 let _ = destroy_snake(app);
+            }
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Focused(true),
+                ..
+            } if label == "main" => {
+                let state = app.state::<Shared>();
+                let mut runtime = lock(&state);
+                if !runtime.exiting && !runtime.pointer_access.in_progress() {
+                    let access = PointerAccess::current();
+                    if access != runtime.pointer_access {
+                        runtime.pointer_access = access;
+                        if access != PointerAccess::Granted {
+                            runtime.disarm();
+                        }
+                        runtime.publish();
+                    }
+                }
             }
             tauri::RunEvent::WindowEvent {
                 label,
@@ -1615,6 +1810,72 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_access_does_not_prompt_or_restart_when_permission_already_exists() {
+        let mut runtime = Runtime::default();
+        assert_eq!(runtime.pending_pointer_access(), None);
+        for access in [PointerAccess::Granted, PointerAccess::RestartRequired] {
+            runtime
+                .request_pointer_access(|| access, || panic!("prompted despite permission"))
+                .unwrap();
+            assert_eq!(runtime.pointer_access, access);
+            assert_eq!(runtime.pending_pointer_access(), None);
+            assert!(runtime.observe_pointer_grant(0).is_none());
+        }
+    }
+
+    #[test]
+    fn pointer_access_restarts_once_after_an_explicit_request_and_a_new_grant() {
+        let mut runtime = Runtime {
+            pointer_enabled: true,
+            ..Runtime::default()
+        };
+        let mut prompts = 0;
+        runtime
+            .request_pointer_access(|| PointerAccess::Missing, || prompts += 1)
+            .unwrap();
+        let request = runtime.pending_pointer_access().unwrap();
+        runtime
+            .request_pointer_access(|| panic!("request already pending"), || prompts += 1)
+            .unwrap();
+        assert_eq!(prompts, 1);
+        assert_eq!(runtime.pointer_access, PointerAccess::Waiting);
+        assert!(!runtime.pointer_enabled);
+        assert_eq!(runtime.pending_pointer_access(), Some(request));
+        assert!(matches!(
+            runtime.observe_pointer_grant(request),
+            Some(MainAction::RestartForPointerAccess)
+        ));
+        assert_eq!(runtime.pointer_access, PointerAccess::Restarting);
+        assert_eq!(runtime.pending_pointer_access(), None);
+        assert!(runtime.observe_pointer_grant(request).is_none());
+    }
+
+    #[test]
+    fn pointer_access_cancels_waiting_and_allows_a_later_retry() {
+        let mut runtime = Runtime::default();
+        let mut prompts = 0;
+        runtime
+            .request_pointer_access(|| PointerAccess::Missing, || prompts += 1)
+            .unwrap();
+        let canceled = runtime.pending_pointer_access().unwrap();
+        runtime.cancel_pointer_access();
+        assert_eq!(runtime.pointer_access, PointerAccess::Missing);
+        assert_eq!(runtime.pending_pointer_access(), None);
+        assert!(runtime.observe_pointer_grant(canceled).is_none());
+        runtime
+            .request_pointer_access(|| PointerAccess::Missing, || prompts += 1)
+            .unwrap();
+        assert_eq!(prompts, 2);
+        assert_eq!(runtime.pointer_access, PointerAccess::Waiting);
+        let retried = runtime.pending_pointer_access().unwrap();
+        assert_ne!(retried, canceled);
+        assert!(runtime.observe_pointer_grant(canceled).is_none());
+        runtime.exiting = true;
+        assert_eq!(runtime.pending_pointer_access(), None);
+        assert!(runtime.observe_pointer_grant(retried).is_none());
+    }
 
     #[test]
     fn eye_damping_keeps_the_default_response_and_bounds_every_setting() {

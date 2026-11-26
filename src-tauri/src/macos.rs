@@ -3,11 +3,26 @@ use core_graphics::display::CGDisplay;
 use core_graphics::event::{CGEvent, CGEventTapLocation, CGEventType, CGMouseButton};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+pub const CHECK_ACCESSIBILITY_PERMISSION: &str = "--check-accessibility-permission";
+const ACCESS_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+const ACCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPreflightPostEventAccess() -> bool;
-    fn CGRequestPostEventAccess() -> bool;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+extern "C" {
+    fn AXIsProcessTrusted() -> u8;
+}
+
+extern "C" {
+    fn eyes_mouse_prompt_accessibility();
+    fn eyes_mouse_open_accessibility_settings() -> bool;
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -67,8 +82,87 @@ pub fn can_move_pointer() -> bool {
     unsafe { CGPreflightPostEventAccess() }
 }
 
-pub fn request_pointer_access() -> bool {
-    unsafe { CGRequestPostEventAccess() }
+pub fn accessibility_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+pub fn prompt_accessibility() {
+    unsafe { eyes_mouse_prompt_accessibility() }
+}
+
+pub fn open_accessibility_settings() -> bool {
+    unsafe { eyes_mouse_open_accessibility_settings() }
+}
+
+struct PermissionProbe {
+    request: u64,
+    child: Child,
+    deadline: Instant,
+}
+
+#[derive(Default)]
+pub struct PermissionChecks {
+    probe: Option<PermissionProbe>,
+    next: Option<Instant>,
+    closed: bool,
+}
+
+impl PermissionChecks {
+    pub fn poll(&mut self, request: Option<u64>) -> Option<u64> {
+        let Some(request) = request.filter(|_| !self.closed) else {
+            self.stop_probe();
+            self.next = None;
+            return None;
+        };
+
+        let now = Instant::now();
+        if let Some(probe) = &mut self.probe {
+            if probe.request == request && now < probe.deadline {
+                match probe.child.try_wait() {
+                    Ok(Some(status)) => {
+                        self.probe = None;
+                        return status.success().then_some(request);
+                    }
+                    Ok(None) => return None,
+                    Err(_) => {}
+                }
+            }
+            self.stop_probe();
+        }
+
+        if self.next.is_none_or(|next| now >= next) {
+            self.next = Some(now + ACCESS_PROBE_INTERVAL);
+            // macOS can cache both preflight results for the lifetime of a process.
+            // Run the same executable without starting Tauri, opening windows, or asking for consent.
+            self.probe = std::env::current_exe().ok().and_then(|executable| {
+                let child = Command::new(executable)
+                    .arg(CHECK_ACCESSIBILITY_PERMISSION)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .ok()?;
+                Some(PermissionProbe {
+                    request,
+                    child,
+                    deadline: now + ACCESS_PROBE_TIMEOUT,
+                })
+            });
+        }
+        None
+    }
+
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.stop_probe();
+    }
+
+    fn stop_probe(&mut self) {
+        if let Some(mut probe) = self.probe.take() {
+            let _ = probe.child.kill();
+            let _ = probe.child.wait();
+        }
+    }
 }
 
 pub async fn request_camera_access() -> bool {

@@ -7,6 +7,7 @@ type Mode = 'calibrate' | 'verify'
 type ControlMode = 'eye' | 'head'
 type Camera = 'off' | 'starting' | 'running' | 'error'
 type Quality = 'searching' | 'eyes_closed' | 'tracked' | 'stale'
+type PointerAccess = 'missing' | 'waiting' | 'granted' | 'restart_required' | 'restarting'
 
 interface Snapshot {
   camera: Camera
@@ -15,6 +16,7 @@ interface Snapshot {
   eyeDamping: number
   calibrated: boolean
   pointerEnabled: boolean
+  pointerAccess: PointerAccess
   pauseAvailable: boolean
   point: Point | null
   validation: { medianPoints: number; p90Points: number } | null
@@ -40,6 +42,7 @@ const state = ref<Snapshot>({
   eyeDamping: 50,
   calibrated: false,
   pointerEnabled: false,
+  pointerAccess: 'missing',
   pauseAvailable: true,
   point: null,
   validation: null,
@@ -58,6 +61,7 @@ const message = ref('')
 const step = ref<Step | null>(null)
 const mode = ref<Mode>('calibrate')
 const exercise = ref<HTMLElement | null>(null)
+const accessibilityDialog = ref<HTMLDialogElement | null>(null)
 let exerciseSequence = 0
 let activateAfterClose = ""
 let resetFocus = ""
@@ -72,6 +76,7 @@ const activeStep = computed(() => resetStep.value ?? step.value)
 const resetLocation = computed(() => ['中央', '左上', '右下'][(resetStep.value?.index ?? 1) - 1])
 const isStarting = computed(() => state.value.camera === 'starting')
 const cameraActive = computed(() => state.value.camera === 'running' || isStarting.value)
+const authorizing = computed(() => state.value.pointerAccess === 'waiting' || state.value.pointerAccess === 'restarting')
 const notice = computed(() => message.value || state.value.message)
 const status = computed(() => {
   if (isStarting.value) return '正在打开相机'
@@ -227,6 +232,17 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 
+function cancelPointerAccess() {
+  if (state.value.pointerAccess === 'waiting') void action('cancel_pointer_access')
+}
+
+watch(authorizing, (open) => {
+  const dialog = accessibilityDialog.value
+  if (!dialog) return
+  if (open && !dialog.open) dialog.showModal()
+  if (!open && dialog.open) dialog.close()
+}, { flush: 'post' })
+
 watch(() => resetStep.value && `${resetStep.value.id}:${resetStep.value.index}`, async (key, previous) => {
   if (!key) {
     await nextTick()
@@ -344,11 +360,20 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
           <div class="control-row">
             <div>
+              <h2>辅助功能权限 <span v-if="state.pointerAccess === 'granted'" class="done">已授权</span></h2>
+              <p v-if="state.pointerAccess === 'missing'">请先授权 Eyes Mouse 控制系统指针。</p>
+              <p v-else-if="state.pointerAccess === 'restart_required'">已授权。请按 ⌘Q 退出，再打开 Eyes Mouse。</p>
+            </div>
+            <button v-if="state.pointerAccess === 'missing'" type="button" class="button accent" :disabled="!connected || pending" @click="action('request_pointer_access')">授权辅助功能</button>
+          </div>
+
+          <div class="control-row">
+            <div>
               <h2>摄像头</h2>
               <p>请正对主屏幕，保持脸部光线均匀。</p>
             </div>
             <button v-if="cameraActive" type="button" class="button" :disabled="pending" @click="action('stop_camera')">关闭相机</button>
-            <button v-else type="button" class="button" :class="{ accent: !state.calibrated }" :disabled="!connected || pending" @click="action('start_camera')">开启相机</button>
+            <button v-else type="button" class="button" :class="{ accent: state.pointerAccess === 'granted' && !state.calibrated }" :disabled="!connected || pending" @click="action('start_camera')">开启相机</button>
           </div>
 
           <div v-if="headControl" class="control-row">
@@ -404,7 +429,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </div>
         </section>
       </div>
-      <p v-if="notice" class="notice" role="status">{{ notice }}</p>
+      <p v-if="notice && !authorizing" class="notice" role="status">{{ notice }}</p>
     </main>
 
     <footer class="app-footer">
@@ -412,4 +437,18 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <span>macOS · 单屏</span>
     </footer>
   </div>
+
+  <dialog ref="accessibilityDialog" class="accessibility-dialog" aria-labelledby="accessibility-title" @cancel.prevent="cancelPointerAccess">
+    <h2 id="accessibility-title">授权辅助功能</h2>
+    <p v-if="state.pointerAccess === 'restarting'" role="status">权限已开启，正在重新启动…</p>
+    <template v-else>
+      <p>在「系统设置 → 隐私与安全性 → 辅助功能」中开启 Eyes Mouse。授权后，应用会自动重新启动。</p>
+      <p v-if="state.calibrated">{{ headControl ? '重启后需要重新设定正面位置。' : '重启后需要重新校准视线。' }}</p>
+      <p v-if="message" class="notice" role="alert">{{ message }}</p>
+      <div class="button-group dialog-actions">
+        <button type="button" class="button" :disabled="pending" @click="cancelPointerAccess">取消</button>
+        <button type="button" class="button accent" :disabled="pending" autofocus @click="action('open_accessibility_settings')">打开系统设置</button>
+      </div>
+    </template>
+  </dialog>
 </template>
