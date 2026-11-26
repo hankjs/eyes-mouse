@@ -400,6 +400,12 @@ struct RefinementCapture {
 }
 
 #[derive(Default)]
+struct FullscreenExercise {
+    original_frame: WindowFrame,
+    hidden_snake: bool,
+}
+
+#[derive(Default)]
 struct Runtime {
     camera: Camera,
     quality: Quality,
@@ -421,7 +427,7 @@ struct Runtime {
     head_motion_at: Option<Instant>,
     stream: Option<Channel<Snapshot>>,
     session: Option<Session>,
-    exercise_frame: Option<WindowFrame>,
+    exercise_frame: Option<FullscreenExercise>,
     closing_exercise: bool,
     gestures: Detector,
     reset_sequence: u32,
@@ -1329,6 +1335,36 @@ fn refresh_displays(app: &AppHandle) {
     dispatch_main_action(app, action);
 }
 
+impl FullscreenExercise {
+    fn open(window: &WebviewWindow, screen: Screen) -> Result<Self, String> {
+        let original_frame = macos::open_exercise(window, screen)?;
+        let overlay = running_snake_window(window.app_handle());
+        if let Some(overlay) = &overlay {
+            if let Err(error) = overlay.hide() {
+                let _ = macos::close_exercise(window, original_frame);
+                return Err(error.to_string());
+            }
+        }
+        Ok(Self {
+            original_frame,
+            hidden_snake: overlay.is_some(),
+        })
+    }
+
+    fn close(self, app: &AppHandle) -> Result<(), String> {
+        let Some(window) = app.get_webview_window("main") else {
+            return Ok(());
+        };
+        let result = macos::close_exercise(&window, self.original_frame);
+        if self.hidden_snake {
+            if let Some(overlay) = running_snake_window(app) {
+                let _ = snake::show(&overlay);
+            }
+        }
+        result
+    }
+}
+
 fn open_reset(app: &AppHandle, id: u32) {
     refresh_displays(app);
     let state = app.state::<Shared>();
@@ -1351,9 +1387,8 @@ fn open_reset(app: &AppHandle, id: u32) {
         app.show().map_err(|error| error.to_string())?;
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
-        destroy_snake(app)?;
         window.set_focus().map_err(|error| error.to_string())?;
-        macos::open_exercise(window, screen)
+        FullscreenExercise::open(window, screen)
     })();
     let mut runtime = lock(&state);
     let reset = runtime.reset.as_mut().filter(|reset| reset.id == id);
@@ -1371,7 +1406,7 @@ fn open_reset(app: &AppHandle, id: u32) {
         }
         (None, Ok(frame)) => {
             drop(runtime);
-            let _ = macos::close_exercise(window.as_ref().unwrap(), frame);
+            let _ = frame.close(app);
         }
         (None, Err(_)) => {}
     }
@@ -1383,12 +1418,9 @@ fn close_exercise(app: &AppHandle) -> Result<(), String> {
     let Some(frame) = frame else {
         return Ok(());
     };
-    let result = app
-        .get_webview_window("main")
-        .map(|window| macos::close_exercise(&window, frame))
-        .transpose();
+    let result = frame.close(app);
     lock(&state).closing_exercise = false;
-    result.map(|_| ())
+    result
 }
 
 #[tauri::command]
@@ -1768,6 +1800,16 @@ fn require_snake_controls(window: &WebviewWindow) -> Result<(), String> {
     Ok(())
 }
 
+fn running_snake_window(app: &AppHandle) -> Option<WebviewWindow> {
+    let state = app.state::<Shared>();
+    let runtime = lock(&state);
+    if runtime.exiting || !matches!(runtime.snake, snake::Status::Open { .. }) {
+        return None;
+    }
+    drop(runtime);
+    app.get_webview_window(snake::LABEL)
+}
+
 fn destroy_snake(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<Shared>();
     if matches!(lock(&state).snake, snake::Status::Closing) {
@@ -1822,6 +1864,9 @@ fn snake_pointer(
     }
     let (restart, snake_size) = {
         let runtime = lock(&state);
+        if runtime.calibration_active() {
+            return Ok(None);
+        }
         let snake::Status::Open { restart } = runtime.snake else {
             return Ok(None);
         };
@@ -1947,7 +1992,7 @@ fn begin_exercise_on_main(window: &WebviewWindow, mode: Exercise) -> Result<Step
     runtime.message = None;
     runtime.publish();
     drop(runtime);
-    let fullscreen = destroy_snake(app).and_then(|()| macos::open_exercise(window, screen));
+    let fullscreen = FullscreenExercise::open(window, screen);
     let mut runtime = lock(&state);
     match fullscreen {
         Ok(frame) if runtime.session.is_some() => {
@@ -1956,7 +2001,7 @@ fn begin_exercise_on_main(window: &WebviewWindow, mode: Exercise) -> Result<Step
         }
         Ok(frame) => {
             drop(runtime);
-            let _ = macos::close_exercise(window, frame);
+            let _ = frame.close(app);
             Err("校准已取消，请重新开始。".into())
         }
         Err(error) => {
@@ -2632,7 +2677,7 @@ mod tests {
             samples: Vec::new(),
             capture: Some(Capture::new(Instant::now())),
         });
-        runtime.exercise_frame = Some(WindowFrame::default());
+        runtime.exercise_frame = Some(FullscreenExercise::default());
         runtime.neutral = Some((external, [0.0; 2]));
         runtime.point = Some([0.5, 0.5]);
         runtime.pointer_enabled = true;
@@ -2922,7 +2967,7 @@ mod tests {
                 selected_screen: Some(screen),
                 stream: Some(Channel::new(|_| Ok(()))),
                 reset: Some(ResetSession::new(1, screen, started)),
-                exercise_frame: Some(WindowFrame::default()),
+                exercise_frame: Some(FullscreenExercise::default()),
                 ..Runtime::default()
             };
             runtime.finish_calibration(screen, &samples).unwrap();
@@ -2976,7 +3021,7 @@ mod tests {
             mapping: Some((screen, mapping)),
             stream: Some(Channel::new(|_| Ok(()))),
             reset: Some(reset),
-            exercise_frame: Some(WindowFrame::default()),
+            exercise_frame: Some(FullscreenExercise::default()),
             ..Runtime::default()
         };
         let mut corner = features(RESET_POINTS[1]);
