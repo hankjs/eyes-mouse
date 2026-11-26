@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Gaze Mouse",
+  "productName": "IngridMeow",
   "version": "0.1.0",
   "identifier": "com.hankjs.gazemouse",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Gaze Mouse",
+        "title": "IngridMeow",
         "width": 940,
         "height": 700,
         "minWidth": 600,

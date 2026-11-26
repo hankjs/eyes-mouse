@@ -1382,7 +1382,7 @@ fn subscribe(
     channel: Channel<Snapshot>,
 ) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Gaze Mouse 主窗口订阅状态。".into());
+        return Err("请从 IngridMeow 主窗口订阅状态。".into());
     }
     let action = {
         let mut runtime = lock(&state);
@@ -1511,7 +1511,7 @@ async fn start_camera(app: AppHandle, state: State<'_, Shared>) -> Result<(), St
     }
     if !permission {
         runtime.stop(Some(
-            "请在 macOS「隐私与安全性 → 相机」允许 Gaze Mouse，然后重试。".into(),
+            "请在 macOS「隐私与安全性 → 相机」允许 IngridMeow，然后重试。".into(),
         ));
         return Ok(());
     }
@@ -1608,7 +1608,7 @@ fn open_accessibility_settings(
 
 fn require_pointer_controls(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Gaze Mouse 主窗口管理指针。".into());
+        return Err("请从 IngridMeow 主窗口管理指针。".into());
     }
     Ok(())
 }
@@ -1661,27 +1661,48 @@ fn check_pointer_ready(runtime: &Runtime) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn open_snake(
-    app: AppHandle,
-    window: WebviewWindow,
-    state: State<'_, Shared>,
-    launch: State<'_, snake::Launch>,
-) -> Result<(), String> {
+async fn open_snake(window: WebviewWindow) -> Result<(), String> {
     require_snake_controls(&window)?;
+    launch_snake(&window).await
+}
+
+fn launch_snake_at_startup(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = launch_snake(&window).await {
+            let state = window.state::<Shared>();
+            let mut runtime = lock(&state);
+            if !runtime.exiting && !runtime.calibration_active() && runtime.message.is_none() {
+                runtime.message = Some(format!("未能自动打开贪吃喵。{error}"));
+                runtime.publish();
+            }
+        }
+    });
+}
+
+async fn launch_snake(window: &WebviewWindow) -> Result<(), String> {
+    let app = window.app_handle();
+    let state = app.state::<Shared>();
+    let launch = app.state::<snake::Launch>();
     let _launch = launch.0.lock().await;
-    let calibrating = "请结束屏幕校准后再打开贪吃蛇。";
+    let calibrating = "请结束屏幕校准后再打开贪吃喵。";
     {
         let runtime = lock(&state);
+        if runtime.exiting || app.get_webview_window("main").is_none() {
+            return Err("IngridMeow 正在退出。".into());
+        }
         if runtime.calibration_active() {
             return Err(calibrating.into());
         }
         match runtime.snake {
             snake::Status::Open { .. } => return Ok(()),
-            snake::Status::Closing => return Err("贪吃蛇正在关闭，请重试。".into()),
+            snake::Status::Closing => return Err("贪吃喵正在关闭，请重试。".into()),
             snake::Status::Closed => {}
         }
     }
-    let (overlay, loaded) = snake::create(&window)?;
+    let (overlay, loaded) = snake::create(window)?;
     let loaded = matches!(
         tokio::time::timeout(Duration::from_secs(5), loaded).await,
         Ok(Ok(()))
@@ -1697,15 +1718,16 @@ async fn open_snake(
                 if runtime.calibration_active() {
                     return Err(calibrating.into());
                 }
-                if matches!(runtime.snake, snake::Status::Closing)
+                if runtime.exiting
+                    || matches!(runtime.snake, snake::Status::Closing)
                     || handle.get_webview_window(snake::LABEL).is_none()
                     || handle.get_webview_window("main").is_none()
                 {
-                    return Err("贪吃蛇已关闭。".into());
+                    return Err("贪吃喵已关闭。".into());
                 }
             }
             if !loaded {
-                return Err("贪吃蛇加载失败，请重试。".into());
+                return Err("贪吃喵加载失败，请重试。".into());
             }
             snake::show(&overlay).map_err(|error| error.to_string())?;
             let mut runtime = lock(&state);
@@ -1724,7 +1746,7 @@ async fn open_snake(
 
 fn require_snake_controls(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Gaze Mouse 主窗口控制贪吃蛇。".into());
+        return Err("请从 IngridMeow 主窗口控制贪吃喵。".into());
     }
     Ok(())
 }
@@ -1755,7 +1777,7 @@ fn restart_snake(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), 
         *restart = restart.wrapping_add(1);
         return Ok(());
     }
-    Err("贪吃蛇尚未打开。".into())
+    Err("贪吃喵尚未打开。".into())
 }
 
 #[tauri::command]
@@ -1764,7 +1786,7 @@ fn snake_pointer(
     state: State<'_, Shared>,
 ) -> Result<Option<snake::PointerSample>, String> {
     if window.label() != snake::LABEL {
-        return Err("只能在贪吃蛇窗口读取游戏指针。".into());
+        return Err("只能在贪吃喵窗口读取游戏指针。".into());
     }
     let snake::Status::Open { restart } = lock(&state).snake else {
         return Ok(None);
@@ -2201,8 +2223,9 @@ pub fn run() {
             snake_pointer
         ])
         .build(tauri::generate_context!())
-        .expect("build Gaze Mouse")
+        .expect("build IngridMeow")
         .run(|app, event| match event {
+            tauri::RunEvent::Ready => launch_snake_at_startup(app),
             tauri::RunEvent::ExitRequested { .. } => {
                 cancel_pointer_access_on_exit(app);
             }

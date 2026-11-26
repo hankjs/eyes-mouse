@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { HEAD_RADIUS, SnakeGame } from './snake.ts'
+import { CHARACTER_INSET, HEAD_RADIUS, SnakeGame } from './snake.ts'
 
 function moveTo(game, x, y, frameTime = 1 / 60) {
   game.setTarget({ x, y })
@@ -10,7 +10,7 @@ function moveTo(game, x, y, frameTime = 1 / 60) {
   }
 }
 
-test('the snake can start in any direction and stop or leave the field', () => {
+test('Ingrid can start in any direction and stop or leave the field', () => {
   const game = new SnakeGame(1000, 600, () => 0)
   moveTo(game, 340, 300)
   assert.ok(Math.abs(game.head.x - 340) <= 1)
@@ -24,9 +24,40 @@ test('the snake can start in any direction and stop or leave the field', () => {
   const paused = game.head
   assert.equal(game.advance(1), false)
   assert.equal(game.head, paused)
+  assert.equal(game.gait, 'idle')
   moveTo(game, -20, 250)
-  assert.ok(game.head.x >= HEAD_RADIUS)
-  assert.ok(game.head.x <= HEAD_RADIUS + 1)
+  assert.ok(game.head.x >= CHARACTER_INSET)
+  assert.ok(game.head.x <= CHARACTER_INSET + 1)
+})
+
+test('gaits use Euclidean distance with hysteresis and return to idle after arrival', () => {
+  const game = new SnakeGame(1000, 600, () => 0)
+  game.setTarget({ x: 535, y: 335 })
+  game.advance(0)
+  assert.equal(game.gait, 'crawl')
+  game.setTarget({ x: 542, y: 342 })
+  game.advance(0)
+  assert.equal(game.gait, 'crawl')
+  game.setTarget({ x: 548, y: 348 })
+  game.advance(0)
+  assert.equal(game.gait, 'walk')
+  game.setTarget({ x: 542, y: 342 })
+  game.advance(0)
+  assert.equal(game.gait, 'walk')
+
+  const target = { x: 340, y: 140 }
+  game.setTarget(target)
+  const gaits = new Set()
+  let frames = 0
+  while (game.advance(1 / 60)) {
+    gaits.add(game.gait)
+    assert.ok(++frames < 300)
+  }
+  assert.deepEqual([...gaits], ['jump', 'walk', 'crawl'])
+  assert.equal(game.facing, -1)
+  assert.equal(game.gait, 'idle')
+  assert.equal(game.gaitTime, 0)
+  assert.ok(Math.hypot(target.x - game.head.x, target.y - game.head.y) <= 1)
 })
 
 test('curved motion leaves a continuous trail', () => {
@@ -46,7 +77,8 @@ test('the head can cross the body in a delayed frame, reverse along it and keep 
   moveTo(game, 530, 300)
   moveTo(game, 530, 325)
   moveTo(game, 507, 325)
-  game.setTarget({ x: 507, y: 260 })
+  game.setTarget({ x: 507, y: 230 })
+  assert.equal(game.advance(1), true)
   assert.equal(game.advance(1), true)
   assert.ok(game.head.y < 300)
   assert.ok(game.trail.some((point) => point.y === 300 && point.x > game.head.x))
@@ -91,4 +123,12 @@ test('eating grows the trail and replaces an exhausted batch at open spots', () 
 test('food generation returns when the field is too small', () => {
   const tiny = new SnakeGame(20, 20, () => 0.999)
   assert.equal(tiny.food.length, 0)
+})
+
+test('food spawned at the edge stays reachable by the whole-character movement bounds', () => {
+  const game = new SnakeGame(1000, 600, () => 0)
+  assert.equal(game.food[0].x, CHARACTER_INSET)
+  assert.equal(game.food[0].y, CHARACTER_INSET)
+  moveTo(game, 0, 0)
+  assert.equal(game.score, 1)
 })

@@ -13,11 +13,20 @@ export interface Food extends Point {
   color: string
 }
 
-export const HEAD_RADIUS = 10
-export const BODY_RADIUS = 7
+export type Gait = 'idle' | 'crawl' | 'walk' | 'jump'
+export type Facing = -1 | 1
 
+export const HEAD_RADIUS = 16
+export const CHARACTER_INSET = 38
+export const HOP_TAKEOFF = 0.11
+export const HOP_LANDING = 0.42
+export const HOP_DURATION = 0.54
+
+const CRAWL_DISTANCE = 56
+const WALK_DISTANCE = 64
+const JUMP_DISTANCE = 220
+const LAND_DISTANCE = 190
 const START_LENGTH = 84
-const SPEED = 540
 const MAX_STEP = 4
 const STOP_DISTANCE = 1
 const FOOD_GAP = 8
@@ -39,10 +48,12 @@ export class SnakeGame {
   readonly trail: TrailPoint[]
   readonly food: Food[] = []
   score = 0
-  heading = 0
+  gait: Gait = 'idle'
+  gaitTime = 0
+  facing: Facing = 1
 
   private length = START_LENGTH
-  private target: Point | null = null
+  private target: { cursor: Point; destination: Point } | null = null
   private retryFoodAt = 0
 
   constructor(
@@ -61,27 +72,41 @@ export class SnakeGame {
   setTarget(point: Point | null) {
     if (!point) {
       this.target = null
-      return
+      this.rest()
+      return false
     }
-    const insetX = Math.min(HEAD_RADIUS, this.width / 2)
-    const insetY = Math.min(HEAD_RADIUS, this.height / 2)
-    this.target = {
+    const insetX = Math.min(CHARACTER_INSET, this.width / 2)
+    const insetY = Math.min(CHARACTER_INSET, this.height / 2)
+    const destination = {
       x: clamp(point.x, insetX, this.width - insetX),
       y: clamp(point.y, insetY, this.height - insetY),
     }
+    this.target = { cursor: point, destination }
+    const moving = Math.hypot(destination.x - this.head.x, destination.y - this.head.y) > STOP_DISTANCE
+    if (!moving) this.rest()
+    return moving
   }
 
   advance(seconds: number): boolean {
     if (!this.target) return false
-    let remaining = SPEED * clamp(seconds, 0, 0.05)
-    const dx = this.target.x - this.head.x
-    const dy = this.target.y - this.head.y
+    const { cursor, destination } = this.target
+    const dx = destination.x - this.head.x
+    const dy = destination.y - this.head.y
     const distance = Math.hypot(dx, dy)
     if (distance <= STOP_DISTANCE) return false
-    this.heading = Math.atan2(dy, dx)
+    if (Math.abs(dx) > distance * 0.16) this.facing = dx < 0 ? -1 : 1
+
+    this.updateGait(Math.hypot(cursor.x - this.head.x, cursor.y - this.head.y))
+    const elapsed = clamp(seconds, 0, 0.05)
+    let speed = this.gait === 'crawl' ? 150 : 310
+    if (this.gait === 'jump') {
+      const hop = this.gaitTime % HOP_DURATION
+      speed = hop < HOP_TAKEOFF ? 160 : hop < HOP_LANDING ? 510 : 220
+    }
+    this.gaitTime += elapsed
 
     // Keep each move shorter than the contact radius, even after a delayed frame.
-    remaining = Math.min(distance, remaining)
+    let remaining = Math.min(distance, speed * elapsed)
     while (remaining > 0) {
       const step = Math.min(MAX_STEP, remaining)
       const next = {
@@ -102,7 +127,28 @@ export class SnakeGame {
       }
       remaining -= step
     }
-    return Math.hypot(this.target.x - this.head.x, this.target.y - this.head.y) > STOP_DISTANCE
+    const moving = Math.hypot(destination.x - this.head.x, destination.y - this.head.y) > STOP_DISTANCE
+    if (!moving) this.rest()
+    return moving
+  }
+
+  private rest() {
+    this.gait = 'idle'
+    this.gaitTime = 0
+  }
+
+  private updateGait(gap: number) {
+    if (this.gait === 'jump') {
+      const hop = this.gaitTime % HOP_DURATION
+      // Finish the current hop when the cursor gets closer, unless it is already at our feet.
+      if (gap > LAND_DISTANCE || (gap > WALK_DISTANCE && hop < HOP_LANDING)) return
+    }
+    const crawlDistance = this.gait === 'crawl' ? WALK_DISTANCE : CRAWL_DISTANCE
+    const nextGait = gap >= JUMP_DISTANCE ? 'jump' : gap <= crawlDistance ? 'crawl' : 'walk'
+    if (nextGait !== this.gait) {
+      this.gait = nextGait
+      this.gaitTime = 0
+    }
   }
 
   private nearBody(point: Point, radius: number) {
@@ -150,14 +196,15 @@ export class SnakeGame {
   }
 
   private openSpot(radius: number): Point | null {
-    const inset = radius + FOOD_GAP
+    const clearance = radius + FOOD_GAP
+    const inset = Math.max(CHARACTER_INSET, clearance)
     const width = this.width - 2 * inset
     const height = this.height - 2 * inset
     if (width <= 0 || height <= 0) return null
     const open = (point: Point) => {
-      if (this.food.some((pellet) => within(point, pellet, inset + pellet.radius))) return false
-      const clearance = inset + HEAD_RADIUS
-      return !within(point, this.head, clearance) && !this.nearBody(point, clearance)
+      if (this.food.some((pellet) => within(point, pellet, clearance + pellet.radius))) return false
+      const bodyClearance = clearance + HEAD_RADIUS
+      return !within(point, this.head, bodyClearance) && !this.nearBody(point, bodyClearance)
     }
     for (let attempt = 0; attempt < 32; attempt++) {
       const point = { x: inset + this.random() * width, y: inset + this.random() * height }

@@ -6,7 +6,7 @@ if [ ! -x .venv/bin/python ]; then
   uv venv --python 3.14 .venv
 fi
 if ! .venv/bin/python -c 'import platform, sys; sys.exit(not (platform.machine() == "arm64" and platform.system() == "Darwin" and sys.version_info[:2] == (3, 14)))'; then
-  printf '%s\n' 'Gaze Mouse requires native arm64 Python 3.14 on macOS.' >&2
+  printf '%s\n' 'IngridMeow requires native arm64 Python 3.14 on macOS.' >&2
   exit 1
 fi
 uv pip sync --python .venv/bin/python tracker/requirements.lock
