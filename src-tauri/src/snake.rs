@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use tauri::utils::config::BackgroundThrottlingPolicy;
@@ -8,6 +8,27 @@ use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 
 pub const LABEL: &str = "snake";
+
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(try_from = "u16")]
+pub struct Size(u16);
+
+impl Default for Size {
+    fn default() -> Self {
+        Self(200)
+    }
+}
+
+impl TryFrom<u16> for Size {
+    type Error = &'static str;
+
+    fn try_from(value: u16) -> Result<Self, Self::Error> {
+        if !(100..=300).contains(&value) || !value.is_multiple_of(25) {
+            return Err("贪吃喵大小须在 100% 到 300% 之间，每档相差 25%。");
+        }
+        Ok(Self(value))
+    }
+}
 
 #[derive(Default)]
 pub struct Launch(pub tokio::sync::Mutex<()>);
@@ -23,9 +44,11 @@ pub enum Status {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PointerSample {
     pub point: Option<[f64; 2]>,
     pub restart: u32,
+    pub snake_size: Size,
 }
 
 extern "C" {
@@ -86,7 +109,11 @@ pub fn show(window: &WebviewWindow) -> tauri::Result<()> {
     Ok(())
 }
 
-pub fn pointer_sample(window: &WebviewWindow, restart: u32) -> tauri::Result<PointerSample> {
+pub fn pointer_sample(
+    window: &WebviewWindow,
+    restart: u32,
+    snake_size: Size,
+) -> tauri::Result<PointerSample> {
     let handle = window.ns_window()?;
     let (mut x, mut y) = (0.0, 0.0);
     // Wry dispatches synchronous WKWebView commands on the main thread.
@@ -94,5 +121,6 @@ pub fn pointer_sample(window: &WebviewWindow, restart: u32) -> tauri::Result<Poi
     Ok(PointerSample {
         point: inside.then_some([x, y]),
         restart,
+        snake_size,
     })
 }

@@ -37,6 +37,7 @@ const REFINEMENT_EXPIRED: &str = "局部校正已超时。指针已暂停。";
 const REFINEMENT_NEEDS_GAZE: &str = "请看准目标约一秒，再按 ⌃⇧M。";
 const EYE_DAMPING_FILE: &str = "eye-damping.json";
 const CONTROL_MODE_FILE: &str = "control-mode.json";
+const SNAKE_SIZE_FILE: &str = "snake-size.json";
 const LEGACY_IDENTIFIER: &str = "com.hankjs.eyesmouse";
 const DISPLAY_RECONFIGURING: &str = "显示器设置正在更改，请稍后重试。";
 
@@ -211,6 +212,7 @@ struct Snapshot {
     message: Option<String>,
     reset_exercise: Option<ResetStep>,
     snake_open: bool,
+    snake_size: snake::Size,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -440,6 +442,7 @@ struct Runtime {
     refinement_capture: Option<RefinementCapture>,
     message: Option<String>,
     snake: snake::Status,
+    snake_size: snake::Size,
 }
 
 type Shared = Mutex<Runtime>;
@@ -478,6 +481,7 @@ impl Runtime {
                 .filter(|reset| reset.visible)
                 .and_then(ResetSession::step),
             snake_open: matches!(self.snake, snake::Status::Open { .. }),
+            snake_size: self.snake_size,
         };
         if let Some(channel) = &self.stream {
             if channel.send(snapshot).is_err() {
@@ -604,6 +608,19 @@ impl Runtime {
         if self.eye_damping != eye_damping {
             write_preference(path, eye_damping)?;
             self.eye_damping = eye_damping;
+            self.publish();
+        }
+        Ok(())
+    }
+
+    fn set_snake_size(
+        &mut self,
+        path: &Path,
+        snake_size: snake::Size,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.snake_size != snake_size {
+            write_preference(path, snake_size)?;
+            self.snake_size = snake_size;
             self.publish();
         }
         Ok(())
@@ -1781,6 +1798,21 @@ fn restart_snake(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), 
 }
 
 #[tauri::command]
+fn set_snake_size(
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+    snake_size: snake::Size,
+) -> Result<snake::Size, String> {
+    require_snake_controls(&window)?;
+    let mut runtime = lock(&state);
+    preference_path(window.app_handle(), SNAKE_SIZE_FILE)
+        .map_err(Into::into)
+        .and_then(|path| runtime.set_snake_size(&path, snake_size))
+        .map_err(|error| format!("无法保存贪吃喵大小。{error}"))?;
+    Ok(runtime.snake_size)
+}
+
+#[tauri::command]
 fn snake_pointer(
     window: WebviewWindow,
     state: State<'_, Shared>,
@@ -1788,10 +1820,14 @@ fn snake_pointer(
     if window.label() != snake::LABEL {
         return Err("只能在贪吃喵窗口读取游戏指针。".into());
     }
-    let snake::Status::Open { restart } = lock(&state).snake else {
-        return Ok(None);
+    let (restart, snake_size) = {
+        let runtime = lock(&state);
+        let snake::Status::Open { restart } = runtime.snake else {
+            return Ok(None);
+        };
+        (restart, runtime.snake_size)
     };
-    snake::pointer_sample(&window, restart)
+    snake::pointer_sample(&window, restart, snake_size)
         .map(Some)
         .map_err(|error| error.to_string())
 }
@@ -2179,6 +2215,8 @@ pub fn run() {
                     &config.join(EYE_DAMPING_FILE),
                     &legacy.join(EYE_DAMPING_FILE),
                 );
+                runtime.snake_size =
+                    load_preference(&config.join(SNAKE_SIZE_FILE), &legacy.join(SNAKE_SIZE_FILE));
             }
             drop(runtime);
             let handle = app.handle().clone();
@@ -2220,6 +2258,7 @@ pub fn run() {
             open_snake,
             close_snake,
             restart_snake,
+            set_snake_size,
             snake_pointer
         ])
         .build(tauri::generate_context!())
@@ -2423,6 +2462,38 @@ mod tests {
                 load_preference::<EyeDamping>(&path, &legacy_path),
                 EyeDamping::default()
             );
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn snake_size_saves_and_restores_only_supported_sizes() {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("ingrid-size-{}-{timestamp}", std::process::id()));
+        let path = directory.join(SNAKE_SIZE_FILE);
+        let legacy_path = directory.join(LEGACY_IDENTIFIER).join(SNAKE_SIZE_FILE);
+        let mut runtime = Runtime::default();
+        let default: snake::Size = load_preference(&path, &legacy_path);
+        assert_eq!(default, runtime.snake_size);
+        assert_eq!(serde_json::to_string(&default).unwrap(), "200");
+
+        let saved = snake::Size::try_from(275).unwrap();
+        runtime.set_snake_size(&path, saved).unwrap();
+        assert_eq!(runtime.snake_size, saved);
+        assert_eq!(load_preference::<snake::Size>(&path, &legacy_path), saved);
+
+        fs::create_dir(path.with_extension(format!("{}.tmp", std::process::id()))).unwrap();
+        assert!(runtime.set_snake_size(&path, default).is_err());
+        assert_eq!(runtime.snake_size, saved);
+        assert_eq!(load_preference::<snake::Size>(&path, &legacy_path), saved);
+
+        for malformed in ["", "99", "124", "301", "200.5", "\"200\""] {
+            fs::write(&path, malformed).unwrap();
+            assert_eq!(load_preference::<snake::Size>(&path, &legacy_path), default);
         }
         fs::remove_dir_all(directory).unwrap();
     }

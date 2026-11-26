@@ -55,6 +55,7 @@ h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.03em; line-height: 1.
 .intro p { font-size: 14px; color: var(--muted); line-height: 1.65; }
 
 .workspace { display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(235px, 1fr); gap: 26px; align-items: start; }
+.preview-column { min-width: 0; }
 .preview {
   margin: 0;
   border-radius: 12px;
@@ -137,12 +138,13 @@ h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.03em; line-height: 1.
 .control-select { font-family: inherit; max-width: 100%; }
 .display-control { grid-template-columns: minmax(0, 1fr); gap: 5px; }
 .display-control .control-select { text-overflow: ellipsis; }
-.damping-control { gap: 4px; }
-.damping-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.damping-heading .numbers { color: var(--muted); font-size: 13px; }
-.damping-slider { width: 100%; min-height: 28px; margin: 0; accent-color: var(--accent); }
-.damping-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-.damping-control .damping-error { color: var(--accent); }
+.range-control { gap: 4px; }
+.snake-size-control { margin-top: 5px; }
+.range-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.range-heading .numbers { color: var(--muted); font-size: 13px; }
+.range-slider { width: 100%; min-height: 28px; margin: 0; accent-color: var(--accent); }
+.range-slider:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.range-control .range-error { color: var(--accent); }
 .accessibility-dialog {
   width: min(400px, calc(100% - 40px));
   padding: 22px;

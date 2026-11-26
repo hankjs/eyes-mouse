@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { Channel, invoke } from '@tauri-apps/api/core'
+import { DEFAULT_SNAKE_SIZE, SNAKE_SIZE_MAX, SNAKE_SIZE_MIN, SNAKE_SIZE_STEP } from './snake'
 
 type Point = [number, number]
 type Mode = 'calibrate' | 'verify'
@@ -35,6 +36,7 @@ interface Snapshot {
   message: string | null
   resetExercise: ResetStep | null
   snakeOpen: boolean
+  snakeSize: number
 }
 
 interface Step {
@@ -67,6 +69,7 @@ const state = ref<Omit<Snapshot, 'pointerAccess' | 'displays'> & { pointerAccess
   message: null,
   resetExercise: null,
   snakeOpen: false,
+  snakeSize: DEFAULT_SNAKE_SIZE,
 })
 const connected = ref(false)
 const pending = ref(false)
@@ -76,6 +79,9 @@ const capturingNeutral = ref(false)
 const eyeDampingDraft = ref<number | null>(null)
 const savedEyeDamping = ref<number | null>(null)
 const eyeDampingError = ref('')
+const snakeSizeDraft = ref<number | null>(null)
+const savedSnakeSize = ref<number | null>(null)
+const snakeSizeError = ref('')
 const message = ref('')
 const step = ref<Step | null>(null)
 const mode = ref<Mode>('calibrate')
@@ -85,12 +91,14 @@ let exerciseSequence = 0
 let activateAfterClose = ""
 let resetFocus = ""
 let savingEyeDamping = false
+let savingSnakeSize = false
 let restoreDisplayFocus = false
 
 const tracked = computed(() => state.value.camera === 'running' && state.value.quality === 'tracked')
 const headControl = computed(() => state.value.controlMode === 'head')
 // A snapshot may arrive after the slider's newer save confirmation.
 const eyeDamping = computed(() => eyeDampingDraft.value ?? savedEyeDamping.value ?? state.value.eyeDamping)
+const snakeSize = computed(() => snakeSizeDraft.value ?? savedSnakeSize.value ?? state.value.snakeSize ?? DEFAULT_SNAKE_SIZE)
 const resetStep = computed(() => state.value.resetExercise)
 const activeStep = computed(() => resetStep.value ?? step.value)
 const resetLocation = computed(() => ['中央', '左上', '右下'][(resetStep.value?.index ?? 1) - 1])
@@ -211,6 +219,23 @@ async function changeEyeDamping(event: Event) {
     if (eyeDampingDraft.value === requested) eyeDampingDraft.value = null
   }
   savingEyeDamping = false
+}
+
+async function changeSnakeSize(event: Event) {
+  snakeSizeDraft.value = (event.currentTarget as HTMLInputElement).valueAsNumber
+  snakeSizeError.value = ''
+  if (savingSnakeSize) return
+  savingSnakeSize = true
+  while (snakeSizeDraft.value !== null) {
+    const requested: number = snakeSizeDraft.value
+    try {
+      savedSnakeSize.value = await invoke<number>('set_snake_size', { snakeSize: requested })
+    } catch (error) {
+      if (snakeSizeDraft.value === requested) snakeSizeError.value = errorText(error)
+    }
+    if (snakeSizeDraft.value === requested) snakeSizeDraft.value = null
+  }
+  savingSnakeSize = false
 }
 
 async function captureNeutral() {
@@ -413,33 +438,47 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </header>
 
       <div class="workspace">
-        <section class="preview" aria-labelledby="preview-title">
-          <header class="preview-header">
-            <h2 id="preview-title">{{ headControl ? '头动方向预览' : '注视点预览' }}</h2>
-            <span v-if="state.pointerEnabled" class="live-label"><i aria-hidden="true"></i>指针已启用</span>
-            <span v-else-if="state.refinementActive" class="preview-mode">正在局部校正</span>
-            <span v-else class="preview-mode">指针暂停</span>
-          </header>
-          <div class="plot" aria-hidden="true">
-            <div class="plot-guides"></div>
-            <span class="plot-corner top-left"></span><span class="plot-corner top-right"></span>
-            <span class="plot-corner bottom-left"></span><span class="plot-corner bottom-right"></span>
-            <template v-if="state.point">
-              <span class="gaze-line horizontal" :style="coordinates(state.point)"></span>
-              <span class="gaze-line vertical" :style="coordinates(state.point)"></span>
-              <span class="gaze-point" :style="coordinates(state.point)"></span>
-            </template>
-            <span v-else class="idle-cross"></span>
-          </div>
-          <footer class="preview-footer">
-            <span v-if="headControl"><i v-if="state.point" class="legend-dot" aria-hidden="true"></i>{{ headPreview }}</span>
-            <template v-else>
-              <span v-if="state.point"><i class="legend-dot" aria-hidden="true"></i>预测注视位置</span>
-              <span v-else>{{ state.calibrated ? '等待有效的眼动数据' : '完成校准后显示预测位置' }}</span>
-              <span v-if="state.point" class="numbers">{{ Math.round(state.point[0] * 100) }}% / {{ Math.round(state.point[1] * 100) }}%</span>
-            </template>
-          </footer>
-        </section>
+        <div class="preview-column">
+          <section class="preview" aria-labelledby="preview-title">
+            <header class="preview-header">
+              <h2 id="preview-title">{{ headControl ? '头动方向预览' : '注视点预览' }}</h2>
+              <span v-if="state.pointerEnabled" class="live-label"><i aria-hidden="true"></i>指针已启用</span>
+              <span v-else-if="state.refinementActive" class="preview-mode">正在局部校正</span>
+              <span v-else class="preview-mode">指针暂停</span>
+            </header>
+            <div class="plot" aria-hidden="true">
+              <div class="plot-guides"></div>
+              <span class="plot-corner top-left"></span><span class="plot-corner top-right"></span>
+              <span class="plot-corner bottom-left"></span><span class="plot-corner bottom-right"></span>
+              <template v-if="state.point">
+                <span class="gaze-line horizontal" :style="coordinates(state.point)"></span>
+                <span class="gaze-line vertical" :style="coordinates(state.point)"></span>
+                <span class="gaze-point" :style="coordinates(state.point)"></span>
+              </template>
+              <span v-else class="idle-cross"></span>
+            </div>
+            <footer class="preview-footer">
+              <span v-if="headControl"><i v-if="state.point" class="legend-dot" aria-hidden="true"></i>{{ headPreview }}</span>
+              <template v-else>
+                <span v-if="state.point"><i class="legend-dot" aria-hidden="true"></i>预测注视位置</span>
+                <span v-else>{{ state.calibrated ? '等待有效的眼动数据' : '完成校准后显示预测位置' }}</span>
+                <span v-if="state.point" class="numbers">{{ Math.round(state.point[0] * 100) }}% / {{ Math.round(state.point[1] * 100) }}%</span>
+              </template>
+            </footer>
+          </section>
+          <section class="control-row range-control snake-size-control" aria-labelledby="snake-size-title">
+            <div class="range-heading">
+              <h2 id="snake-size-title"><label for="snake-size">贪吃喵大小</label></h2>
+              <span class="numbers" aria-hidden="true">{{ snakeSize }}%</span>
+            </div>
+            <input id="snake-size" class="range-slider" type="range"
+              :min="SNAKE_SIZE_MIN" :max="SNAKE_SIZE_MAX" :step="SNAKE_SIZE_STEP"
+              :value="snakeSize" :disabled="!connected" :aria-valuetext="`${snakeSize}%`"
+              aria-describedby="snake-size-hint" @input="changeSnakeSize">
+            <p id="snake-size-hint">原版大小为 100%，默认 {{ DEFAULT_SNAKE_SIZE }}%。</p>
+            <p v-if="snakeSizeError" class="range-error" role="status">{{ snakeSizeError }}</p>
+          </section>
+        </div>
 
         <section class="controls" aria-label="指针控制设置">
           <div class="control-row">
@@ -509,15 +548,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </p>
           </div>
 
-          <div v-if="!headControl" class="control-row damping-control">
-            <div class="damping-heading">
+          <div v-if="!headControl" class="control-row range-control">
+            <div class="range-heading">
               <h2><label for="eye-damping">眼动阻尼</label></h2>
               <span class="numbers" aria-hidden="true">{{ eyeDamping }}</span>
             </div>
-            <input id="eye-damping" class="damping-slider" type="range" min="0" max="100" step="1"
+            <input id="eye-damping" class="range-slider" type="range" min="0" max="100" step="1"
               :value="eyeDamping" :disabled="!connected || pending" aria-describedby="eye-damping-hint" @input="changeEyeDamping">
             <p id="eye-damping-hint">数值越低，跟随越快；数值越高，移动越稳。</p>
-            <p v-if="eyeDampingError" class="damping-error" role="status">{{ eyeDampingError }}</p>
+            <p v-if="eyeDampingError" class="range-error" role="status">{{ eyeDampingError }}</p>
           </div>
 
           <div class="control-row">

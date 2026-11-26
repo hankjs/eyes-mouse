@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { invoke, isTauri } from '@tauri-apps/api/core'
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import atlas from './ingrid-poses.png'
 import { IDLE_GESTURES, idlePose, movementPose, POSES } from './ingrid'
-import { CHARACTER_INSET, SnakeGame } from './snake'
+import { DEFAULT_SNAKE_SIZE, SnakeGame, type Food } from './snake'
 
 type Cursor = [number, number]
 
 interface PointerSample {
   point: Cursor | null
   restart: number
+  snakeSize: number
 }
 
 const POLL_INTERVAL = 1000 / 30
@@ -19,6 +20,7 @@ const FEET_OFFSET = 32
 const IDLE_DURATION = 720
 const field = ref<HTMLCanvasElement | null>(null)
 const character = ref<HTMLCanvasElement | null>(null)
+const food = shallowRef<Food[]>([])
 
 let fieldContext: CanvasRenderingContext2D | null = null
 let characterContext: CanvasRenderingContext2D | null = null
@@ -27,6 +29,9 @@ let reducedMotion: MediaQueryList | null = null
 let game: SnakeGame | null = null
 let width = 0
 let height = 0
+let snakeSize = isTauri() ? null : DEFAULT_SNAKE_SIZE
+let characterScale = 0
+let characterCanvasSize = 0
 let movementFrame = 0
 let previousFrame = 0
 let idleFrame = 0
@@ -39,14 +44,12 @@ let readingPointer = false
 let pollSession = 0
 let pollTimer: number | undefined
 
-function disk(ctx: CanvasRenderingContext2D, x: number, y: number, radius: number, color: string) {
-  ctx.beginPath()
-  ctx.arc(x, y, radius, 0, 2 * Math.PI)
-  ctx.fillStyle = color
-  ctx.fill()
-}
-
 function drawField() {
+  const nextFood = game?.food ?? []
+  const displayedFood = food.value
+  if (nextFood.length !== displayedFood.length || nextFood.some((pellet, index) => pellet !== displayedFood[index])) {
+    food.value = nextFood.slice()
+  }
   const ctx = fieldContext
   if (!ctx || !game) return
   ctx.clearRect(0, 0, width, height)
@@ -62,38 +65,39 @@ function drawField() {
     ctx.strokeStyle = 'rgba(99, 124, 185, 0.48)'
     ctx.stroke()
   }
-
-  for (const { x, y, radius, color } of game.food) {
-    disk(ctx, x, y, radius + 2, '#292022')
-    disk(ctx, x, y, radius, color)
-    disk(ctx, x - radius * 0.26, y - radius * 0.28, 2, '#fff1d9')
-  }
 }
 
 function drawCharacter(pose?: ReturnType<typeof movementPose>) {
   const element = character.value
   const ctx = characterContext
-  if (!element || !ctx || !game || !image?.naturalWidth) return
+  if (!element || !ctx || !game || !image?.naturalWidth || !characterCanvasSize) return
 
   const { x, y } = game.head
-  const middle = SPRITE_CANVAS_SIZE / 2
-  element.style.transform = `translate3d(${x - middle}px, ${y - middle}px, 0)`
-  ctx.clearRect(0, 0, SPRITE_CANVAS_SIZE, SPRITE_CANVAS_SIZE)
-
+  const middle = characterCanvasSize / 2
   const poseToDraw = pose ?? movementPose(game.gait, game.facing, game.gaitTime, reducedMotion?.matches)
   const [sx, sy, sw, sh] = POSES[poseToDraw.sprite]
-  const fit = Math.min(1, width / (2 * CHARACTER_INSET), height / (2 * CHARACTER_INSET))
-  const spriteWidth = sw * SPRITE_SCALE * fit * (poseToDraw.scaleX ?? 1)
-  const spriteHeight = sh * SPRITE_SCALE * fit * (poseToDraw.scaleY ?? 1)
-  const feet = FEET_OFFSET * fit
+  const spriteWidth = sw * SPRITE_SCALE * characterScale * (poseToDraw.scaleX ?? 1)
+  const spriteHeight = sh * SPRITE_SCALE * characterScale * (poseToDraw.scaleY ?? 1)
+  const feet = FEET_OFFSET * characterScale
+  const halfWidth = spriteWidth / 2
   const tilt = poseToDraw.tilt ?? 0
-  const top = spriteHeight * Math.cos(tilt) + spriteWidth / 2 * Math.abs(Math.sin(tilt))
-  const lift = Math.min((poseToDraw.lift ?? 0) * fit, Math.max(0, y + feet - top))
+  const cos = Math.cos(tilt)
+  const sin = Math.sin(tilt)
+  const bottom = halfWidth * Math.abs(sin)
+  const top = spriteHeight * cos + bottom
+  const left = halfWidth * cos + Math.max(0, -spriteHeight * sin)
+  const right = halfWidth * cos + Math.max(0, spriteHeight * sin)
+  const lift = (poseToDraw.lift ?? 0) * characterScale
 
+  // Keep the whole pose in view while the game head can still reach food at the edges.
+  const drawX = Math.min(width - right, Math.max(left, x))
+  const feetY = Math.min(height - bottom, Math.max(top, y + feet - lift))
+  element.style.transform = `translate3d(${drawX - middle}px, ${feetY - feet - middle}px, 0)`
+  ctx.clearRect(0, 0, characterCanvasSize, characterCanvasSize)
   ctx.save()
-  ctx.translate(middle, middle + feet - lift)
+  ctx.translate(middle, middle + feet)
   ctx.rotate(tilt)
-  ctx.drawImage(image, sx, sy, sw, sh, -spriteWidth / 2, -spriteHeight, spriteWidth, spriteHeight)
+  ctx.drawImage(image, sx, sy, sw, sh, -halfWidth, -spriteHeight, spriteWidth, spriteHeight)
   ctx.restore()
 }
 
@@ -153,12 +157,27 @@ function resetGame() {
   scheduleIdle()
 }
 
+function sizeCharacterCanvas() {
+  const element = character.value
+  const ctx = characterContext
+  if (!element || !ctx || snakeSize === null) return
+  characterScale = Math.min(snakeSize / 100, width / SPRITE_CANVAS_SIZE, height / SPRITE_CANVAS_SIZE)
+  characterCanvasSize = SPRITE_CANVAS_SIZE * characterScale
+  const pixels = Math.ceil(characterCanvasSize * Math.min(window.devicePixelRatio, 2))
+  element.width = pixels
+  element.height = pixels
+  element.style.width = `${characterCanvasSize}px`
+  element.style.height = `${characterCanvasSize}px`
+  if (!pixels) return
+  const scale = pixels / characterCanvasSize
+  ctx.setTransform(scale, 0, 0, scale, 0, 0)
+  ctx.imageSmoothingQuality = 'high'
+}
+
 function sizeCanvases() {
   const fieldElement = field.value
-  const characterElement = character.value
   const ctx = fieldContext
-  const sprite = characterContext
-  if (!fieldElement || !characterElement || !ctx || !sprite) return
+  if (!fieldElement || !ctx) return
   const nextWidth = fieldElement.clientWidth
   const nextHeight = fieldElement.clientHeight
   const resized = width !== nextWidth || height !== nextHeight
@@ -167,11 +186,8 @@ function sizeCanvases() {
   const scale = Math.min(window.devicePixelRatio, 2)
   fieldElement.width = Math.ceil(width * scale)
   fieldElement.height = Math.ceil(height * scale)
-  characterElement.width = Math.ceil(SPRITE_CANVAS_SIZE * scale)
-  characterElement.height = Math.ceil(SPRITE_CANVAS_SIZE * scale)
   ctx.setTransform(scale, 0, 0, scale, 0, 0)
-  sprite.setTransform(scale, 0, 0, scale, 0, 0)
-  sprite.imageSmoothingQuality = 'high'
+  sizeCharacterCanvas()
   if (resized) resetGame()
   else {
     drawField()
@@ -228,9 +244,19 @@ async function pollPointer(session: number) {
     if (polling) void pollPointer(pollSession)
     return
   }
-  if (sample && sample.restart !== restart) {
-    restart = sample.restart
-    resetGame()
+  if (sample) {
+    const nextSize = sample.snakeSize ?? DEFAULT_SNAKE_SIZE
+    const resized = nextSize !== snakeSize
+    if (resized) {
+      snakeSize = nextSize
+      sizeCharacterCanvas()
+    }
+    if (sample.restart !== restart) {
+      restart = sample.restart
+      resetGame()
+    } else if (resized) {
+      drawCharacter()
+    }
   }
   steer(sample?.point ?? null)
   // Wait for each native reply before scheduling another read.
@@ -292,24 +318,43 @@ onUnmounted(() => {
 
 <template>
   <canvas ref="field" class="playfield" aria-hidden="true"></canvas>
-  <canvas
-    ref="character"
-    class="character"
-    :style="{ width: SPRITE_CANVAS_SIZE + 'px', height: SPRITE_CANVAS_SIZE + 'px' }"
-    aria-hidden="true"
-  ></canvas>
+  <canvas ref="character" class="character" aria-hidden="true"></canvas>
+  <!-- Pellets stay visible when their positions overlap the character. -->
+  <span v-for="{ x, y, radius, color } in food" :key="`${x},${y}`" class="pellet" aria-hidden="true"
+    :style="{ left: `${x}px`, top: `${y}px`, '--pellet-diameter': `${2 * radius}px`, backgroundColor: color }"></span>
 </template>
 
 <style>
 html, body { margin: 0; overflow: hidden; background: transparent; }
-canvas {
+canvas, .pellet {
   position: fixed;
+  pointer-events: none;
+}
+canvas {
   top: 0;
   left: 0;
-  pointer-events: none;
 }
 .playfield {
   width: 100%;
   height: 100%;
+}
+.pellet {
+  box-sizing: content-box;
+  width: var(--pellet-diameter);
+  height: var(--pellet-diameter);
+  border: 2px solid #292022;
+  border-radius: 50%;
+  translate: -50% -50%;
+}
+.pellet::after {
+  content: '';
+  position: absolute;
+  left: 37%;
+  top: 36%;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #fff1d9;
+  translate: -50% -50%;
 }
 </style>

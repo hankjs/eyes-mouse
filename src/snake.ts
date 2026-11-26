@@ -18,6 +18,10 @@ export type Facing = -1 | 1
 
 export const HEAD_RADIUS = 16
 export const CHARACTER_INSET = 38
+export const SNAKE_SIZE_MIN = 100
+export const SNAKE_SIZE_MAX = 300
+export const SNAKE_SIZE_STEP = 25
+export const DEFAULT_SNAKE_SIZE = 200
 export const HOP_TAKEOFF = 0.11
 export const HOP_LANDING = 0.42
 export const HOP_DURATION = 0.54
