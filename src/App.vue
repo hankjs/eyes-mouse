@@ -285,9 +285,12 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <span class="mark" aria-hidden="true"><i></i></span>
         <span>Eyes Mouse</span>
       </div>
-      <span class="camera-status" :class="{ live: tracked }" role="status">
-        <i aria-hidden="true"></i>{{ status }}
-      </span>
+      <div class="topbar-actions">
+        <span class="camera-status" :class="{ live: tracked }" role="status">
+          <i aria-hidden="true"></i>{{ status }}
+        </span>
+        <button type="button" class="button" :disabled="pending" @click="action('open_snake')">贪吃蛇</button>
+      </div>
     </header>
 
     <main>

@@ -4,6 +4,7 @@ use crate::calibration::{
 };
 use crate::gestures::{Detector, Eyes, Gesture};
 use crate::macos::{self, Screen};
+use crate::snake;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
@@ -840,6 +841,7 @@ fn open_reset(app: &AppHandle, id: u32) {
         window.show().map_err(|error| error.to_string())?;
         window.unminimize().map_err(|error| error.to_string())?;
         monitor(window)?;
+        snake::close_for_calibration(app);
         window.set_focus().map_err(|error| error.to_string())?;
         window
             .set_simple_fullscreen(true)
@@ -1098,6 +1100,35 @@ fn monitor(window: &WebviewWindow) -> Result<tauri::Monitor, String> {
 }
 
 #[tauri::command]
+async fn open_snake(
+    app: AppHandle,
+    window: WebviewWindow,
+    state: State<'_, Shared>,
+    launch: State<'_, snake::Launch>,
+) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("请从 Eyes Mouse 主窗口打开贪吃蛇。".into());
+    }
+    let _launch = launch.0.lock().await;
+    let calibrating = "请结束屏幕校准后再打开贪吃蛇。";
+    if lock(&state).calibration_active() {
+        return Err(calibrating.into());
+    }
+    let overlay = match app.get_webview_window(snake::LABEL) {
+        Some(overlay) => overlay,
+        None => snake::create(&window).await?,
+    };
+    if lock(&state).calibration_active() {
+        let _ = overlay.destroy();
+        return Err(calibrating.into());
+    }
+    overlay
+        .show()
+        .and_then(|()| overlay.set_focus())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 async fn capture_neutral(window: WebviewWindow, state: State<'_, Shared>) -> Result<(), String> {
     monitor(&window)?;
     let started = Instant::now();
@@ -1184,6 +1215,7 @@ fn begin_exercise(
     runtime.message = None;
     runtime.publish();
     drop(runtime);
+    snake::close_for_calibration(window.app_handle());
     if let Err(error) = window.set_simple_fullscreen(true) {
         lock(&state).session = None;
         return Err(error.to_string());
@@ -1383,6 +1415,7 @@ pub fn run() {
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP);
     tauri::Builder::default()
         .manage(Shared::default())
+        .manage(snake::Launch::default())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(move |app, key, event| {
@@ -1426,7 +1459,9 @@ pub fn run() {
             begin_exercise,
             cancel_exercise,
             capture_target,
-            reset_target_ready
+            reset_target_ready,
+            open_snake,
+            snake::close_snake
         ])
         .build(tauri::generate_context!())
         .expect("build Eyes Mouse")
