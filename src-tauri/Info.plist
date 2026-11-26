@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
     <key>NSCameraUsageDescription</key>
-    <string>Eyes Mouse 使用摄像头在本机估计视线位置，以便移动鼠标指针。</string>
+    <string>Gaze Mouse 使用摄像头在本机估计视线位置，以便移动鼠标指针。</string>
 </dict>
 </plist>

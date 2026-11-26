@@ -49,7 +49,7 @@ pub fn create(main: &WebviewWindow) -> Result<(WebviewWindow, oneshot::Receiver<
         LABEL,
         WebviewUrl::App("snake.html".into()),
     )
-    .title("贪吃蛇 · Eyes Mouse")
+    .title("贪吃蛇 · Gaze Mouse")
     .position(position.x, position.y)
     .inner_size(size.width, size.height)
     .visible(false)

@@ -5,10 +5,11 @@ use crate::calibration::{
 use crate::gestures::{Detector, Eyes, Gesture};
 use crate::macos::{self, Display, Motion, MotionResult, Screen, WindowFrame};
 use crate::snake;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,6 +31,7 @@ const RESET_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
 const RESET_SETTLE: Duration = Duration::from_millis(500);
 const EYE_DAMPING_FILE: &str = "eye-damping.json";
 const CONTROL_MODE_FILE: &str = "control-mode.json";
+const LEGACY_IDENTIFIER: &str = "com.hankjs.eyesmouse";
 const DISPLAY_RECONFIGURING: &str = "显示器设置正在更改，请稍后重试。";
 
 type HeadPose = [f64; 2];
@@ -64,13 +66,6 @@ impl TryFrom<u8> for EyeDamping {
 }
 
 impl EyeDamping {
-    fn load(path: &Path) -> Self {
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
-    }
-
     fn weight(self, distance: f64) -> f64 {
         let weight = (0.12 + 3.0 * distance).min(0.68);
         // Scale the adaptive weight from 1.4× at minimum damping to 0.6× at maximum damping.
@@ -81,6 +76,17 @@ impl EyeDamping {
 
 fn preference_path(app: &AppHandle, name: &str) -> Result<PathBuf, tauri::Error> {
     Ok(app.path().app_config_dir()?.join(name))
+}
+
+fn load_preference<T: DeserializeOwned + Default>(path: &Path, legacy_path: &Path) -> T {
+    let bytes = match fs::read(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => fs::read(legacy_path),
+        result => result,
+    };
+    bytes
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn write_preference(path: &Path, value: impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
@@ -1132,7 +1138,7 @@ fn subscribe(
     channel: Channel<Snapshot>,
 ) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Eyes Mouse 主窗口订阅状态。".into());
+        return Err("请从 Gaze Mouse 主窗口订阅状态。".into());
     }
     let action = {
         let mut runtime = lock(&state);
@@ -1261,7 +1267,7 @@ async fn start_camera(app: AppHandle, state: State<'_, Shared>) -> Result<(), St
     }
     if !permission {
         runtime.stop(Some(
-            "请在 macOS「隐私与安全性 → 相机」允许 Eyes Mouse，然后重试。".into(),
+            "请在 macOS「隐私与安全性 → 相机」允许 Gaze Mouse，然后重试。".into(),
         ));
         return Ok(());
     }
@@ -1358,7 +1364,7 @@ fn open_accessibility_settings(
 
 fn require_pointer_controls(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Eyes Mouse 主窗口管理指针。".into());
+        return Err("请从 Gaze Mouse 主窗口管理指针。".into());
     }
     Ok(())
 }
@@ -1471,7 +1477,7 @@ async fn open_snake(
 
 fn require_snake_controls(window: &WebviewWindow) -> Result<(), String> {
     if window.label() != "main" {
-        return Err("请从 Eyes Mouse 主窗口控制贪吃蛇。".into());
+        return Err("请从 Gaze Mouse 主窗口控制贪吃蛇。".into());
     }
     Ok(())
 }
@@ -1896,13 +1902,18 @@ pub fn run() {
             let mut runtime = lock(&state);
             runtime.pause_available = registered;
             runtime.pointer_access = PointerAccess::current();
-            runtime.control_mode = preference_path(app.handle(), CONTROL_MODE_FILE)
-                .ok()
-                .and_then(|path| fs::read(path).ok())
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .unwrap_or_default();
-            if let Ok(path) = preference_path(app.handle(), EYE_DAMPING_FILE) {
-                runtime.eye_damping = EyeDamping::load(&path);
+            if let (Ok(config), Ok(config_root)) =
+                (app.path().app_config_dir(), app.path().config_dir())
+            {
+                let legacy = config_root.join(LEGACY_IDENTIFIER);
+                runtime.control_mode = load_preference(
+                    &config.join(CONTROL_MODE_FILE),
+                    &legacy.join(CONTROL_MODE_FILE),
+                );
+                runtime.eye_damping = load_preference(
+                    &config.join(EYE_DAMPING_FILE),
+                    &legacy.join(EYE_DAMPING_FILE),
+                );
             }
             drop(runtime);
             let handle = app.handle().clone();
@@ -1947,7 +1958,7 @@ pub fn run() {
             snake_pointer
         ])
         .build(tauri::generate_context!())
-        .expect("build Eyes Mouse")
+        .expect("build Gaze Mouse")
         .run(|app, event| match event {
             tauri::RunEvent::ExitRequested { .. } => {
                 cancel_pointer_access_on_exit(app);
@@ -2109,24 +2120,43 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("eyes-mouse-{}-{timestamp}", std::process::id()));
         let path = directory.join(EYE_DAMPING_FILE);
+        let legacy_path = directory.join(LEGACY_IDENTIFIER).join(EYE_DAMPING_FILE);
         let mut runtime = Runtime::default();
-        assert_eq!(EyeDamping::load(&path), runtime.eye_damping);
+        assert_eq!(
+            load_preference::<EyeDamping>(&path, &legacy_path),
+            runtime.eye_damping
+        );
+
+        write_preference(&legacy_path, 101).unwrap();
+        assert_eq!(
+            load_preference::<EyeDamping>(&path, &legacy_path),
+            EyeDamping::default()
+        );
+
+        let legacy = EyeDamping::try_from(20).unwrap();
+        write_preference(&legacy_path, legacy).unwrap();
+        assert_eq!(load_preference::<EyeDamping>(&path, &legacy_path), legacy);
+        assert!(!path.exists());
 
         let saved = EyeDamping::try_from(80).unwrap();
         runtime.set_eye_damping(&path, saved).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "80");
-        assert_eq!(EyeDamping::load(&path), saved);
+        assert_eq!(load_preference::<EyeDamping>(&path, &legacy_path), saved);
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), "20");
 
         fs::create_dir(path.with_extension(format!("{}.tmp", std::process::id()))).unwrap();
         assert!(runtime
             .set_eye_damping(&path, EyeDamping::try_from(20).unwrap())
             .is_err());
         assert_eq!(runtime.eye_damping, saved);
-        assert_eq!(EyeDamping::load(&path), saved);
+        assert_eq!(load_preference::<EyeDamping>(&path, &legacy_path), saved);
 
         for malformed in ["", "{", "101", "-1", "25.5", "\"25\""] {
             fs::write(&path, malformed).unwrap();
-            assert_eq!(EyeDamping::load(&path), EyeDamping::default());
+            assert_eq!(
+                load_preference::<EyeDamping>(&path, &legacy_path),
+                EyeDamping::default()
+            );
         }
         fs::remove_dir_all(directory).unwrap();
     }

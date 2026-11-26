@@ -357,7 +357,7 @@ onMounted(async () => {
     await invoke('subscribe', { channel })
     connected.value = true
   } catch {
-    message.value = '无法连接桌面服务。请从 Eyes Mouse 应用打开此界面。'
+    message.value = '无法连接桌面服务。请从 Gaze Mouse 应用打开此界面。'
   }
 })
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
@@ -383,7 +383,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     <header class="topbar">
       <div class="wordmark">
         <span class="mark" aria-hidden="true"><i></i></span>
-        <span>Eyes Mouse</span>
+        <span>Gaze Mouse</span>
       </div>
       <div class="topbar-actions">
         <span class="camera-status" :class="{ live: tracked }" role="status">
@@ -458,8 +458,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
                 辅助功能权限
                 <span v-if="state.pointerAccess === 'granted' || state.pointerAccess === 'restart_required'" class="done">已有权限</span>
               </h2>
-              <p v-if="state.pointerAccess === 'missing'">请先授权 Eyes Mouse 控制系统指针。</p>
-              <p v-else-if="state.pointerAccess === 'restart_required'">请按 ⌘Q 退出，再打开 Eyes Mouse。</p>
+              <p v-if="state.pointerAccess === 'missing'">请先授权 Gaze Mouse 控制系统指针。</p>
+              <p v-else-if="state.pointerAccess === 'restart_required'">请按 ⌘Q 退出，再打开 Gaze Mouse。</p>
             </div>
             <button v-if="state.pointerAccess === 'missing'" type="button" class="button accent" :disabled="!connected || pending" @click="action('request_pointer_access')">授权辅助功能</button>
           </div>
@@ -539,7 +539,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     <h2 id="accessibility-title">授权辅助功能</h2>
     <p v-if="state.pointerAccess === 'restarting'" role="status">权限已开启，正在重新启动…</p>
     <template v-else>
-      <p>在「系统设置 → 隐私与安全性 → 辅助功能」中开启 Eyes Mouse。授权后，应用会自动重新启动。</p>
+      <p>在「系统设置 → 隐私与安全性 → 辅助功能」中开启 Gaze Mouse。授权后，应用会自动重新启动。</p>
       <p v-if="state.calibrated">{{ headControl ? '重启后需要重新设定正面位置。' : '重启后需要重新校准视线。' }}</p>
       <p v-if="message" class="notice" role="alert">{{ message }}</p>
       <div class="button-group dialog-actions">
