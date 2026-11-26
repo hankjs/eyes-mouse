@@ -1,3 +1,4 @@
+use crate::geometric_gaze::GeometricGaze;
 use crate::head_compensation::{HeadCompensation, HeadPosition, RecentCorrection, FIT_ERROR};
 use crate::refinement::{CorrectionError, Refinement};
 use serde::Serialize;
@@ -10,6 +11,7 @@ pub type Features = [f64; 4];
 pub struct GazeSample {
     pub features: Features,
     pub head_position: Option<HeadPosition>,
+    pub head_roll: Option<f64>,
 }
 
 impl From<Features> for GazeSample {
@@ -17,6 +19,7 @@ impl From<Features> for GazeSample {
         Self {
             features,
             head_position: None,
+            head_roll: None,
         }
     }
 }
@@ -58,10 +61,31 @@ pub struct Mapping {
     pointer_offset: Point,
     refinement: Refinement,
     eye_pose: Point,
+    geometric_gaze: Option<GeometricGaze>,
     head_compensation: Option<HeadCompensation>,
 }
 
 impl Mapping {
+    pub fn fit_for_screen(
+        samples: &[(GazeSample, Point)],
+        screen_cm: Option<Point>,
+    ) -> Result<Self, &'static str> {
+        let mut mapping = Self::fit(samples)?;
+        mapping.geometric_gaze = screen_cm.and_then(|size| {
+            let (geometry, geometric_rms) = GeometricGaze::fit(size, samples)?;
+            let mut squared_error = 0.0;
+            for held_out in 0..samples.len() {
+                let mut training = samples.to_vec();
+                let (sample, target) = training.remove(held_out);
+                let legacy = Self::fit(&training).ok()?;
+                squared_error += distance(legacy.predict(sample), target).powi(2);
+            }
+            let legacy_rms = (squared_error / samples.len() as f64).sqrt();
+            (geometric_rms <= legacy_rms + 0.018).then_some(geometry)
+        });
+        Ok(mapping)
+    }
+
     pub fn fit(samples: &[(GazeSample, Point)]) -> Result<Self, &'static str> {
         let fit_error = "这次校准位置偏差较大。请坐稳，并在每个点出现后看准再按空格。";
         if samples.is_empty()
@@ -111,6 +135,7 @@ impl Mapping {
             pointer_offset: [0.0; 2],
             refinement: Refinement::default(),
             eye_pose: [center[2], center[3]],
+            geometric_gaze: None,
             head_compensation: None,
         };
         let mut equations = [[0.0; 7]; 5];
@@ -152,6 +177,22 @@ impl Mapping {
         self.head_compensation.is_some()
     }
 
+    pub fn has_geometric_gaze(&self) -> bool {
+        self.geometric_gaze.is_some()
+    }
+
+    pub fn discard_geometry(&mut self) -> bool {
+        if self.geometric_gaze.take().is_none() {
+            return false;
+        }
+        self.head_compensation = None;
+        self.refinement = Refinement::default();
+        self.offset = [0.0; 2];
+        self.pointer_offset = [0.0; 2];
+        self.eye_pose = [self.center[2], self.center[3]];
+        true
+    }
+
     pub fn has_local_refinement(&self) -> bool {
         !self.refinement.is_empty()
     }
@@ -165,7 +206,7 @@ impl Mapping {
         let compensation = HeadCompensation::fit(
             reference,
             samples,
-            |sample| self.predict_linear(sample.features),
+            |sample| self.base_point(sample),
             self.head_compensation.as_ref(),
         )
         .ok_or(FIT_ERROR)?;
@@ -192,7 +233,7 @@ impl Mapping {
             return Err(RESET_ERROR);
         }
 
-        // Use the nine-point fit for gestures and the locally corrected fit for the pointer.
+        // Use the calibrated gaze for gestures and the locally corrected gaze for the pointer.
         let base = self.predict_gaze(center);
         let corrected = self.refinement.correct(base);
         let offset = std::array::from_fn(|axis| target[axis] - base[axis]);
@@ -284,7 +325,8 @@ impl Mapping {
     }
 
     pub fn has_required_head_pose(&self, sample: GazeSample) -> bool {
-        self.head_compensation.is_none() || self.head_correction(sample).is_some()
+        (self.geometric_gaze.is_none() && self.head_compensation.is_none())
+            || self.head_correction(sample).is_some()
     }
 
     pub fn refine(&mut self, sample: GazeSample, confirmed: Point) -> Result<(), CorrectionError> {
@@ -306,7 +348,28 @@ impl Mapping {
     }
 
     fn head_correction(&self, sample: GazeSample) -> Option<Point> {
-        self.head_compensation.as_ref()?.correction(sample)
+        let residual = self
+            .head_compensation
+            .as_ref()
+            .and_then(|compensation| compensation.correction(sample));
+        if self.geometric_gaze.is_none() {
+            return residual;
+        }
+        let linear = self.predict_linear(sample.features);
+        let base = self.base_point(sample)?;
+        let residual = residual.unwrap_or_default();
+        Some(std::array::from_fn(|axis| {
+            base[axis] - linear[axis] + residual[axis]
+        }))
+    }
+
+    fn base_point(&self, sample: GazeSample) -> Option<Point> {
+        let linear = self.predict_linear(sample.features);
+        let Some(geometry) = &self.geometric_gaze else {
+            return Some(linear);
+        };
+        let point = geometry.predict(sample)?;
+        within_distance(point, linear, 0.38).then_some(point)
     }
 
     fn predict_gaze(&self, sample: GazeSample) -> Point {
@@ -411,9 +474,18 @@ impl Fixation {
                 median(&mut values)
             })
         });
+        let mut rolls: Vec<_> = self
+            .frames
+            .iter()
+            .filter(|(_, sample)| sample.head_position.is_some())
+            .filter_map(|(_, sample)| sample.head_roll)
+            .collect();
+        let head_roll = (rolls.len() * 4 >= self.frames.len() * 3).then(|| median(&mut rolls));
+        let head_roll = head_roll.filter(|_| rolls[rolls.len() - 1] - rolls[0] <= 0.075);
         Some(GazeSample {
             features,
             head_position,
+            head_roll,
         })
     }
 
@@ -440,9 +512,12 @@ impl Fixation {
     }
 }
 
-pub(crate) fn solve(mut matrix: [[f64; 7]; 5]) -> Option<[Point; 5]> {
-    for i in 0..5 {
-        let pivot = (i..5).max_by(|a, b| matrix[*a][i].abs().total_cmp(&matrix[*b][i].abs()))?;
+pub(crate) fn solve<const N: usize, const M: usize>(
+    mut matrix: [[f64; M]; N],
+) -> Option<[Point; N]> {
+    debug_assert_eq!(M, N + 2);
+    for i in 0..N {
+        let pivot = (i..N).max_by(|a, b| matrix[*a][i].abs().total_cmp(&matrix[*b][i].abs()))?;
         matrix.swap(i, pivot);
         let divisor = matrix[i][i];
         if divisor.abs() < 1e-10 {
@@ -455,13 +530,13 @@ pub(crate) fn solve(mut matrix: [[f64; 7]; 5]) -> Option<[Point; 5]> {
         for (index, row) in matrix.iter_mut().enumerate() {
             if index != i {
                 let factor = row[i];
-                for j in i..7 {
+                for j in i..M {
                     row[j] -= factor * normalized[j];
                 }
             }
         }
     }
-    Some(matrix.map(|row| [row[5], row[6]]))
+    Some(matrix.map(|row| [row[N], row[N + 1]]))
 }
 
 pub fn median(values: &mut [f64]) -> f64 {
@@ -498,6 +573,7 @@ mod tests {
         GazeSample {
             features: [0.61 - 0.24 * x, 0.02 + 0.16 * y, yaw, pitch],
             head_position: Some([0.04 + tx, -0.03 + ty, 4.12 + depth]),
+            head_roll: None,
         }
     }
 
@@ -908,6 +984,7 @@ mod tests {
             pointer_offset: [0.0; 2],
             refinement: Refinement::default(),
             eye_pose: [0.0; 2],
+            geometric_gaze: None,
             head_compensation: None,
         };
         let anchors = [

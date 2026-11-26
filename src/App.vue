@@ -26,6 +26,7 @@ interface Snapshot {
   displayRevision: number
   eyeDamping: number
   calibrated: boolean
+  geometricGaze: boolean
   headCompensated: boolean
   compensationOpen: boolean
   compensationPhase: CompensationPhase | null
@@ -62,6 +63,7 @@ const state = ref<Omit<Snapshot, 'pointerAccess' | 'displays'> & { pointerAccess
   displayRevision: 0,
   eyeDamping: 50,
   calibrated: false,
+  geometricGaze: false,
   headCompensated: false,
   compensationOpen: false,
   compensationPhase: null,
@@ -577,7 +579,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 
           <div v-else class="control-row">
             <div>
-              <h2>屏幕校准 <span v-if="state.calibrated" class="done">已完成</span></h2>
+              <h2>屏幕校准 <span v-if="state.calibrated" class="done">{{ state.geometricGaze ? '已完成 · 内建屏幕几何' : '已完成' }}</span></h2>
               <p>看准每个亮点后按空格，保持注视，等亮点切换。移动相机或调整坐姿后可重新校准。</p>
             </div>
             <div class="button-group">

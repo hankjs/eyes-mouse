@@ -193,6 +193,7 @@ enum Packet {
         features: Option<Features>,
         pose: Option<HeadPose>,
         head_position: Option<HeadPosition>,
+        head_roll: Option<f64>,
         #[serde(default)]
         bilateral_closed: bool,
     },
@@ -212,6 +213,7 @@ struct Snapshot {
     selected_display_id: Option<u32>,
     display_revision: u32,
     calibrated: bool,
+    geometric_gaze: bool,
     head_compensated: bool,
     compensation_open: bool,
     compensation_phase: Option<CompensationPhase>,
@@ -525,6 +527,7 @@ struct Runtime {
     child: Option<Child>,
     generation: u64,
     camera_started: Option<Instant>,
+    builtin_camera: bool,
     last_frame: Option<Instant>,
     last_tracked: Option<Instant>,
     last_publish: Option<Instant>,
@@ -578,6 +581,11 @@ impl Runtime {
             selected_display_id: self.selected_screen.map(|screen| screen.id),
             display_revision: self.display_revision,
             calibrated: self.calibrated(),
+            geometric_gaze: self.control_mode == ControlMode::Eye
+                && self
+                    .mapping
+                    .as_ref()
+                    .is_some_and(|(_, mapping)| mapping.has_geometric_gaze()),
             head_compensated: self.control_mode == ControlMode::Eye
                 && self
                     .mapping
@@ -867,6 +875,7 @@ impl Runtime {
         self.clear_tracking(Quality::Searching);
         self.neutral = None;
         self.camera_started = None;
+        self.builtin_camera = false;
         self.last_frame = None;
         self.camera = if message.is_some() {
             Camera::Error
@@ -952,6 +961,15 @@ impl Runtime {
     fn accept(&mut self, packet: Packet) -> Option<MainAction> {
         match packet {
             Packet::Ready => {
+                self.builtin_camera = self.builtin_camera && macos::only_camera_is_builtin();
+                if !self.builtin_camera
+                    && self
+                        .mapping
+                        .as_mut()
+                        .is_some_and(|(_, mapping)| mapping.discard_geometry())
+                {
+                    self.validation = None;
+                }
                 self.camera = Camera::Running;
                 self.last_frame = Some(Instant::now());
                 self.publish();
@@ -963,6 +981,7 @@ impl Runtime {
                 features,
                 pose,
                 head_position,
+                head_roll,
                 bilateral_closed,
             } => {
                 let now = Instant::now();
@@ -1009,6 +1028,7 @@ impl Runtime {
                                 head_position: head_position.filter(|&position| {
                                     head_compensation::valid_position(position)
                                 }),
+                                head_roll: head_roll.filter(|roll| roll.is_finite()),
                             });
                         if sample.is_some() {
                             self.last_tracked = Some(now);
@@ -1204,7 +1224,8 @@ impl Runtime {
         screen: Screen,
         samples: &[(GazeSample, Point)],
     ) -> Result<(), &'static str> {
-        let mapping = Mapping::fit(samples)?;
+        let screen_cm = screen.builtin_screen_cm.filter(|_| self.builtin_camera);
+        let mapping = Mapping::fit_for_screen(samples, screen_cm)?;
         self.mapping = Some((screen, mapping));
         self.recent_head_correction.clear();
         self.validation = None;
@@ -1762,6 +1783,7 @@ async fn start_camera(app: AppHandle, state: State<'_, Shared>) -> Result<(), St
         return Ok(());
     }
 
+    runtime.builtin_camera = macos::only_camera_is_builtin();
     let mut child = match command
         .process_group(0)
         .stdin(Stdio::null())
@@ -2682,6 +2704,7 @@ mod tests {
         let sample = GazeSample {
             features: [0.49, 0.06, 0.0, 0.0],
             head_position: Some([0.03, 0.05, 4.1]),
+            head_roll: None,
         };
         let track = |capture: &mut CompensationCapture, timestamp, sample| {
             capture.track(
@@ -2734,6 +2757,7 @@ mod tests {
                 features: Some(_),
                 pose: Some(_),
                 head_position: None,
+                head_roll: None,
                 ..
             }
         ));
@@ -2926,6 +2950,7 @@ mod tests {
             features: None,
             pose,
             head_position: None,
+            head_roll: None,
             bilateral_closed: true,
         };
         let mut runtime = Runtime {
@@ -3151,6 +3176,47 @@ mod tests {
     }
 
     #[test]
+    fn geometry_requires_both_the_builtin_display_and_camera() {
+        let mut builtin = Screen::fixture(1, [0.0, 0.0], 1440.0, 900.0);
+        builtin.builtin_screen_cm = Some([28.65, 17.9]);
+        let external = Screen::fixture(2, [-1920.0, 0.0], 1920.0, 1080.0);
+        let samples = CALIBRATION_POINTS.map(|[x, y]| {
+            (
+                GazeSample {
+                    features: [0.59 - 0.18 * x, 0.15 * y, 0.0, 0.0],
+                    head_position: Some([0.0, 0.0, 4.0]),
+                    head_roll: Some(0.0),
+                },
+                [x, y],
+            )
+        });
+        let mut runtime = Runtime::default();
+        for (screen, builtin_camera, expect_geometry) in [
+            (external, true, false),
+            (builtin, false, false),
+            (builtin, true, true),
+        ] {
+            runtime.builtin_camera = builtin_camera;
+            runtime.finish_calibration(screen, &samples).unwrap();
+            assert_eq!(
+                runtime.mapping.as_ref().unwrap().1.has_geometric_gaze(),
+                expect_geometry
+            );
+        }
+
+        // A new camera stream can lose eligibility without losing the nine-point fit.
+        runtime.builtin_camera = false;
+        runtime.validation = Some(Validation::new(vec![15.0]));
+        runtime.accept(Packet::Ready);
+        let (screen, mapping) = runtime.mapping.unwrap();
+        let (sample, target) = samples[0];
+        assert_eq!(screen, builtin);
+        assert!(!mapping.has_geometric_gaze());
+        assert!((mapping.predict(sample)[0] - target[0]).abs() < 0.012);
+        assert!(runtime.validation.is_none());
+    }
+
+    #[test]
     fn local_correction_requires_recent_gaze_and_a_second_keypress() {
         let now = Instant::now();
         let screen = Screen::fixture(2, [-1920.0, 0.0], 1920.0, 1080.0);
@@ -3323,6 +3389,7 @@ mod tests {
         let sample = |[x, y]: Point, yaw| GazeSample {
             features: [0.59 - 0.18 * (x + 0.8 * yaw), 0.15 * y, yaw, 0.0],
             head_position: Some([0.0, 0.0, 4.0]),
+            head_roll: None,
         };
         let neutral = sample([0.5; 2], 0.0);
         let movement: Vec<_> = (-20..=20)

@@ -54,11 +54,11 @@ impl HeadCompensation {
     pub fn fit(
         reference: GazeSample,
         samples: &[GazeSample],
-        predict: impl Fn(GazeSample) -> Point,
+        predict: impl Fn(GazeSample) -> Option<Point>,
         previous: Option<&Self>,
     ) -> Option<Self> {
         let origin = pose(reference)?;
-        let reference_point = predict(reference);
+        let reference_point = predict(reference)?;
         let reference_correction = previous
             .and_then(|model| model.correction(reference))
             .unwrap_or([0.0; 2]);
@@ -67,7 +67,7 @@ impl HeadCompensation {
             .filter_map(|&sample| {
                 let sample_pose = pose(sample)?;
                 let delta: Motion = std::array::from_fn(|axis| sample_pose[axis] - origin[axis]);
-                let point = predict(sample);
+                let point = predict(sample)?;
                 let residual = std::array::from_fn(|axis| reference_point[axis] - point[axis]);
                 if (0..5).any(|axis| delta[axis].abs() > MAX_DELTA[axis])
                     || length(residual) > 0.36

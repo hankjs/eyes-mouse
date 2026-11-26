@@ -18,6 +18,7 @@ const ACCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn eyes_mouse_only_camera_is_builtin() -> bool;
     fn CGPreflightPostEventAccess() -> bool;
     fn CGDisplayRegisterReconfigurationCallback(
         callback: extern "C" fn(u32, u32, *mut c_void),
@@ -106,6 +107,7 @@ pub struct Screen {
     rotation: f64,
     mode: i32,
     backing_size: [u64; 2],
+    pub builtin_screen_cm: Option<Point>,
     revision: u64,
 }
 
@@ -118,14 +120,32 @@ impl Screen {
         }
         let bounds = display.bounds();
         let mode = display.display_mode()?;
+        let rotation = display.rotation();
+        let builtin_screen_cm =
+            if display.is_builtin() && !display.is_in_mirror_set() && rotation == 0.0 {
+                let size = display.screen_size();
+                let aspect_ratio = bounds.size.width / bounds.size.height;
+                let size_agrees = (size.width / size.height / aspect_ratio - 1.0).abs() <= 0.08;
+                // Core Graphics uses 72 dpi to estimate a size when display data is missing.
+                let estimated = (size.width - bounds.size.width * 25.4 / 72.0).abs() <= 1.0
+                    && (size.height - bounds.size.height * 25.4 / 72.0).abs() <= 1.0;
+                ((200.0..=700.0).contains(&size.width)
+                    && (120.0..=400.0).contains(&size.height)
+                    && size_agrees
+                    && !estimated)
+                    .then_some([size.width / 10.0, size.height / 10.0])
+            } else {
+                None
+            };
         let screen = Self {
             id,
             origin: [bounds.origin.x, bounds.origin.y],
             width: bounds.size.width,
             height: bounds.size.height,
-            rotation: display.rotation(),
+            rotation,
             mode: mode.mode_id(),
             backing_size: [mode.pixel_width(), mode.pixel_height()],
+            builtin_screen_cm,
             revision,
         };
         if screen
@@ -235,6 +255,7 @@ impl Screen {
             rotation: 0.0,
             mode: 0,
             backing_size: [0; 2],
+            builtin_screen_cm: None,
             revision: 0,
         }
     }
@@ -471,6 +492,10 @@ impl PermissionChecks {
             let _ = probe.child.wait();
         }
     }
+}
+
+pub fn only_camera_is_builtin() -> bool {
+    unsafe { eyes_mouse_only_camera_is_builtin() }
 }
 
 pub async fn request_camera_access() -> bool {

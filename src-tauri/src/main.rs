@@ -1,4 +1,5 @@
 mod calibration;
+mod geometric_gaze;
 mod gestures;
 mod head_compensation;
 mod macos;
